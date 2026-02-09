@@ -36,6 +36,7 @@ pub fn context_menu<'a>(
     key_binds: &HashMap<KeyBind, Action>,
     entity: segmented_button::Entity,
     link: Option<String>,
+    is_extra_window: bool,
 ) -> Element<'a, Message> {
     let find_key = |action: &Action| -> String {
         for (key_bind, key_action) in key_binds {
@@ -95,6 +96,17 @@ pub fn context_menu<'a>(
         )),
         Element::from(divider::horizontal::light()),
         Element::from(menu_item(fl!("new-tab"), Action::TabNew)),
+        if is_extra_window {
+            Element::from(menu_item(
+                fl!("move-to-main-window"),
+                Action::TabAttachToMainWindow,
+            ))
+        } else {
+            Element::from(menu_item(
+                fl!("move-to-new-window"),
+                Action::TabDetachToWindow,
+            ))
+        },
         Element::from(menu_item(fl!("menu-settings"), Action::Settings)),
     ];
     #[cfg(feature = "password_manager")]

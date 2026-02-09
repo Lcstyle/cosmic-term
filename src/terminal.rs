@@ -30,14 +30,25 @@ use std::{
     collections::HashMap,
     io, mem,
     sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicU32, Ordering},
+        Arc, Weak,
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
 };
 use tokio::sync::mpsc;
 
 pub use alacritty_terminal::grid::Scroll as TerminalScroll;
+
+static NEXT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TerminalId(u64);
+
+impl TerminalId {
+    pub fn new() -> Self {
+        Self(NEXT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 use crate::{
     config::{ColorSchemeKind, Config as AppConfig, ProfileId},
@@ -96,15 +107,14 @@ impl From<Size> for WindowSize {
 
 #[derive(Clone)]
 pub struct EventProxy(
-    pane_grid::Pane,
-    segmented_button::Entity,
-    mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, Event)>,
+    TerminalId,
+    mpsc::UnboundedSender<(TerminalId, Event)>,
 );
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         //TODO: handle error
-        let _ = self.2.send((self.0, self.1, event));
+        let _ = self.1.send((self.0, event));
     }
 }
 
@@ -179,32 +189,11 @@ impl TerminalPaneGrid {
     }
     pub fn set_focus(&mut self, pane: pane_grid::Pane) {
         self.focus = pane;
-        self.update_terminal_focus();
     }
     pub fn focused(&self) -> pane_grid::Pane {
         self.focus
     }
 
-    pub fn update_terminal_focus(&self) {
-        for (pane, tab_model) in self.panes.panes.iter() {
-            let entity = tab_model.active();
-            if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
-                let mut terminal = terminal.lock().unwrap();
-                terminal.is_focused = self.focus == *pane;
-                terminal.update();
-            }
-        }
-    }
-    pub fn unfocus_all_terminals(&self) {
-        for (_pane, tab_model) in self.panes.panes.iter() {
-            let entity = tab_model.active();
-            if let Some(terminal) = tab_model.data::<Mutex<Terminal>>(entity) {
-                let mut terminal = terminal.lock().unwrap();
-                terminal.is_focused = false;
-                terminal.update();
-            }
-        }
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -249,7 +238,7 @@ pub struct Terminal {
     pub active_hyperlink_id: Option<String>,
     bold_font_weight: Weight,
     buffer: Arc<Buffer>,
-    is_focused: bool,
+    pub is_focused: bool,
     colors: Colors,
     default_attrs: Attrs<'static>,
     dim_font_weight: Weight,
@@ -265,9 +254,8 @@ pub struct Terminal {
 impl Terminal {
     //TODO: error handling
     pub fn new(
-        pane: pane_grid::Pane,
-        entity: segmented_button::Entity,
-        event_tx: mpsc::UnboundedSender<(pane_grid::Pane, segmented_button::Entity, Event)>,
+        terminal_id: TerminalId,
+        event_tx: mpsc::UnboundedSender<(TerminalId, Event)>,
         config: Config,
         options: Options,
         app_config: &AppConfig,
@@ -319,7 +307,7 @@ impl Terminal {
             cell_width,
             cell_height,
         };
-        let event_proxy = EventProxy(pane, entity, event_tx);
+        let event_proxy = EventProxy(terminal_id, event_tx);
         let term = Arc::new(FairMutex::new(Term::new(
             config,
             &size,
