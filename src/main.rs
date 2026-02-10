@@ -508,6 +508,7 @@ pub struct App {
     title_editing_value: String,
     title_editing_input_id: widget::Id,
     title_ai_loading: bool,
+    title_ai_suggestion: Option<String>,
     #[cfg(feature = "password_manager")]
     password_mgr: password_manager::PasswordManager,
 }
@@ -2104,6 +2105,7 @@ impl Application for App {
             title_editing_value: String::new(),
             title_editing_input_id: widget::Id::unique(),
             title_ai_loading: false,
+            title_ai_suggestion: None,
             #[cfg(feature = "password_manager")]
             password_mgr: Default::default(),
         };
@@ -2633,10 +2635,23 @@ impl Application for App {
                 config_set!(focus_follow_mouse, focus_follow_mouse);
             }
             Message::Key(modifiers, key) => {
-                // Intercept Escape during title editing
+                // Intercept keys during title editing
                 if self.title_editing {
-                    if key == Key::Named(iced::keyboard::key::Named::Escape) {
-                        return self.update(Message::TitleEditCancel);
+                    match &key {
+                        Key::Named(iced::keyboard::key::Named::Escape) => {
+                            return self.update(Message::TitleEditCancel);
+                        }
+                        Key::Named(iced::keyboard::key::Named::Tab)
+                        | Key::Named(iced::keyboard::key::Named::ArrowRight)
+                            if self.title_editing_value.is_empty()
+                                && self.title_ai_suggestion.is_some() =>
+                        {
+                            // Accept AI suggestion into input
+                            if let Some(suggestion) = self.title_ai_suggestion.take() {
+                                self.title_editing_value = suggestion;
+                            }
+                        }
+                        _ => {}
                     }
                     // Don't process other keybinds while editing title
                     return Task::none();
@@ -2680,6 +2695,9 @@ impl Application for App {
                 config_set!(opacity, cmp::min(100, opacity));
             }
             Message::PaneClicked(pane) => {
+                if self.title_editing {
+                    return self.update(Message::TitleEditSubmit);
+                }
                 self.set_pane_focus(pane);
                 return self.update_title(Some(pane));
             }
@@ -2960,18 +2978,64 @@ impl Application for App {
                 }
             }
             Message::TitleEditStart => {
-                let current_title = self.core.window.header_title.clone();
-                self.title_editing_value = current_title;
+                self.title_editing_value = String::new();
+                self.title_ai_suggestion = None;
                 self.title_editing = true;
-                return widget::text_input::focus(self.title_editing_input_id.clone());
+
+                // Auto-trigger AI suggestion if API key is available
+                let has_api_key = ai::get_api_key().is_some();
+                let mut tasks = vec![
+                    widget::text_input::focus(self.title_editing_input_id.clone()),
+                ];
+                if has_api_key {
+                    self.title_ai_loading = true;
+                    let content = if let Some(tab_model) = self.focused_active_tab_model() {
+                        let entity = tab_model.active();
+                        if let Some(terminal_id) = tab_model.data::<TerminalId>(entity) {
+                            if let Some(terminal) = self.terminals.get(terminal_id) {
+                                let terminal = terminal.lock().unwrap();
+                                terminal.visible_text()
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    tasks.push(Task::perform(
+                        async move { ai::suggest_terminal_title(&content).await },
+                        |result| cosmic::Action::App(Message::TitleAiResult(result)),
+                    ));
+                }
+                return Task::batch(tasks);
             }
             Message::TitleEditChanged(value) => {
                 self.title_editing_value = value;
             }
             Message::TitleEditSubmit => {
+                // If input is empty but there's a suggestion, accept the suggestion
+                let title = if self.title_editing_value.is_empty() {
+                    self.title_ai_suggestion.take().unwrap_or_default()
+                } else {
+                    self.title_editing_value.clone()
+                };
                 self.title_editing = false;
-                let title = self.title_editing_value.clone();
-                if !title.is_empty() {
+                self.title_ai_suggestion = None;
+
+                if title.is_empty() {
+                    // Empty submit = clear override, restore auto-updating
+                    if let Some(tab_model) = self.focused_active_tab_model() {
+                        let entity = tab_model.active();
+                        if let Some(terminal_id) = tab_model.data::<TerminalId>(entity).copied() {
+                            if let Some(terminal) = self.terminals.get(&terminal_id) {
+                                let mut terminal = terminal.lock().unwrap();
+                                terminal.tab_title_override = None;
+                            }
+                        }
+                    }
+                } else {
                     // Set the title override on the active terminal
                     if let Some(tab_model) = self.focused_active_tab_model() {
                         let entity = tab_model.active();
@@ -2987,14 +3051,17 @@ impl Application for App {
                         let entity = tab_model.active();
                         tab_model.text_set(entity, title);
                     }
-                    return self.update_title(None);
                 }
+                return self.update_title(None);
             }
             Message::TitleEditCancel => {
                 self.title_editing = false;
+                self.title_ai_loading = false;
+                self.title_ai_suggestion = None;
             }
             Message::TitleAiSuggest => {
                 self.title_ai_loading = true;
+                self.title_ai_suggestion = None;
                 let content = if let Some(tab_model) = self.focused_active_tab_model() {
                     let entity = tab_model.active();
                     if let Some(terminal_id) = tab_model.data::<TerminalId>(entity) {
@@ -3017,8 +3084,8 @@ impl Application for App {
             }
             Message::TitleAiResult(suggestion) => {
                 self.title_ai_loading = false;
-                if let Some(title) = suggestion {
-                    self.title_editing_value = title;
+                if self.title_editing {
+                    self.title_ai_suggestion = suggestion;
                 }
             }
             Message::TabAttachToMainWindow(entity) => {
@@ -3700,6 +3767,10 @@ impl Application for App {
                 return self.update_focus();
             }
             Message::WindowUnfocused => {
+                if self.title_editing {
+                    // Auto-save on focus loss
+                    let _ = self.update(Message::TitleEditSubmit);
+                }
                 self.unfocus_all_terminals();
             }
             Message::ZoomIn => {
@@ -3758,34 +3829,34 @@ impl Application for App {
     }
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
-        vec![menu_bar(&self.core, &self.config, &self.key_binds)]
-    }
-
-    fn header_center(&self) -> Vec<Element<'_, Self::Message>> {
         if self.title_editing {
+            // Placeholder: show AI suggestion or loading state
+            let placeholder = if self.title_ai_loading {
+                fl!("title-ai-loading")
+            } else if let Some(ref suggestion) = self.title_ai_suggestion {
+                suggestion.clone()
+            } else {
+                fl!("title-edit-placeholder")
+            };
+
             let mut row_children: Vec<Element<'_, Message>> = vec![
-                widget::text_input(fl!("title-edit-placeholder"), &self.title_editing_value)
+                widget::text_input(placeholder, &self.title_editing_value)
                     .id(self.title_editing_input_id.clone())
                     .on_input(Message::TitleEditChanged)
                     .on_submit(|_| Message::TitleEditSubmit)
-                    .width(Length::Fixed(300.0))
+                    .width(Length::Fill)
                     .into(),
             ];
 
-            // AI suggest button (only if API key is available)
-            if ai::get_api_key().is_some() {
-                let ai_label = if self.title_ai_loading {
-                    fl!("title-ai-loading")
-                } else {
-                    fl!("title-ai-suggest")
-                };
-                let mut ai_btn = widget::button::custom(widget::text(ai_label).size(12))
-                    .padding([4, 8])
-                    .class(style::Button::HeaderBar);
-                if !self.title_ai_loading {
-                    ai_btn = ai_btn.on_press(Message::TitleAiSuggest);
-                }
-                row_children.push(ai_btn.into());
+            // Re-suggest button (only when not already loading)
+            if ai::get_api_key().is_some() && !self.title_ai_loading {
+                row_children.push(
+                    widget::button::custom(icon_cache_get("view-refresh-symbolic", 14))
+                        .on_press(Message::TitleAiSuggest)
+                        .padding(4)
+                        .class(style::Button::Icon)
+                        .into(),
+                );
             }
 
             // Cancel button
@@ -3793,33 +3864,27 @@ impl Application for App {
                 widget::button::custom(icon_cache_get("window-close-symbolic", 14))
                     .on_press(Message::TitleEditCancel)
                     .padding(4)
-                    .class(style::Button::HeaderBar)
+                    .class(style::Button::Icon)
                     .into(),
             );
 
             vec![widget::row::with_children(row_children)
                 .spacing(4)
                 .align_y(Alignment::Center)
+                .width(Length::Fill)
                 .into()]
         } else {
-            let title = self.core.window.header_title.clone();
-            vec![widget::button::custom(
-                widget::text(if title.is_empty() {
-                    fl!("cosmic-terminal")
-                } else {
-                    title
-                })
-                .size(14),
-            )
-            .on_press(Message::TitleEditStart)
-            .padding([4, 12])
-            .class(style::Button::HeaderBar)
-            .into()]
+            vec![menu_bar(&self.core, &self.config, &self.key_binds)]
         }
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
         vec![
+            widget::button::custom(icon_cache_get("edit-symbolic", 16))
+                .on_press(Message::TitleEditStart)
+                .padding(8)
+                .class(style::Button::Icon)
+                .into(),
             widget::button::custom(icon_cache_get("list-add-symbolic", 16))
                 .on_press(Message::TabNew)
                 .padding(8)
