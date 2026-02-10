@@ -249,6 +249,8 @@ pub struct Terminal {
     size: Size,
     use_bright_bold: bool,
     zoom_adj: i8,
+    pub child_pid: Option<u32>,
+    pub pinned: bool,
 }
 
 impl Terminal {
@@ -316,6 +318,7 @@ impl Terminal {
 
         let window_id = 0;
         let pty = tty::new(&options, size.into(), window_id)?;
+        let child_pid = Some(pty.child().id());
 
         let pty_event_loop =
             EventLoop::new(term.clone(), event_proxy, pty, options.drain_on_exit, false)?;
@@ -346,6 +349,8 @@ impl Terminal {
             use_bright_bold,
             zoom_adj: Default::default(),
             is_focused: true,
+            child_pid,
+            pinned: false,
         })
     }
 
@@ -496,6 +501,44 @@ impl Terminal {
             result.push('\n');
         }
         result
+    }
+
+    /// Extract the full scrollback + viewport text, capped at `max_bytes`.
+    pub fn full_scrollback_text(&self, max_bytes: usize) -> String {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let cols = grid.columns();
+        let history = grid.history_size();
+        let screen = grid.screen_lines();
+        let total_lines = history + screen;
+
+        let mut result = String::with_capacity(cols * total_lines.min(4096));
+        for line_idx in 0..total_lines {
+            // Negative lines = history, positive = viewport
+            let row = &grid[Line(line_idx as i32 - history as i32)];
+            let mut line_text = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &row[Column(col)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                line_text.push(cell.c);
+            }
+            result.push_str(line_text.trim_end());
+            result.push('\n');
+            if result.len() >= max_bytes {
+                // Truncate at line boundary
+                break;
+            }
+        }
+        result
+    }
+
+    /// Get the current working directory of the child process via /proc.
+    pub fn current_working_directory(&self) -> Option<std::path::PathBuf> {
+        let pid = self.child_pid?;
+        let link = format!("/proc/{pid}/cwd");
+        std::fs::read_link(&link).ok()
     }
 
     pub fn search(&mut self, value: &str, forwards: bool) {

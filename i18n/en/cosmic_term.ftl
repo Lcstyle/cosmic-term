@@ -110,6 +110,10 @@ title-edit-placeholder = Enter window title...
 title-ai-suggest = AI Suggest
 title-ai-loading = Suggesting...
 
+# Session & Pin
+pin-terminal = Pin Terminal
+unpin-terminal = Unpin Terminal
+
 # Password Manager
 menu-password-manager = Passwords...
 passwords-title = Passwords

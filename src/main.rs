@@ -67,6 +67,7 @@ use crate::menu::MenuState;
 mod terminal_box;
 
 mod ai;
+mod session;
 
 #[cfg(feature = "password_manager")]
 mod password_manager;
@@ -256,6 +257,7 @@ pub enum Action {
     TabActivate8,
     TabAttachToMainWindow,
     TabClose,
+    TogglePin,
     TabDetachToWindow,
     TabNew,
     TabNewNoProfile,
@@ -315,6 +317,13 @@ impl Action {
                 }
             }
             Self::TabClose => Message::TabClose(entity_opt),
+            Self::TogglePin => {
+                if let Some(entity) = entity_opt {
+                    Message::TogglePin(entity)
+                } else {
+                    Message::TabNew // fallback no-op
+                }
+            }
             Self::TabDetachToWindow => {
                 if let Some(entity) = entity_opt {
                     Message::TabDetachToWindow(entity)
@@ -437,6 +446,9 @@ pub enum Message {
     TitleEditCancel,
     TitleAiSuggest,
     TitleAiResult(Option<String>),
+    TogglePin(segmented_button::Entity),
+    SessionSave,
+    CleanupBackups(u64),
     WindowClose,
     WindowFocusGained(window::Id),
     WindowNew,
@@ -509,6 +521,8 @@ pub struct App {
     title_editing_input_id: widget::Id,
     title_ai_loading: bool,
     title_ai_suggestion: Option<String>,
+    session_id: u64,
+    graceful_exit: bool,
     #[cfg(feature = "password_manager")]
     password_mgr: password_manager::PasswordManager,
 }
@@ -802,6 +816,21 @@ impl App {
         &mut self.pane_model
     }
 
+    /// Check if the active tab in the focused window is pinned.
+    fn is_active_tab_pinned(&self) -> bool {
+        let tab_model = match self.focused_active_tab_model() {
+            Some(tm) => tm,
+            None => return false,
+        };
+        let entity = tab_model.active();
+        if let Some(terminal_id) = tab_model.data::<TerminalId>(entity) {
+            if let Some(terminal) = self.terminals.get(terminal_id) {
+                return terminal.lock().unwrap().pinned;
+            }
+        }
+        false
+    }
+
     /// Get the tab model containing a specific entity (searches all windows, focused first)
     fn tab_model_for_entity(&self, entity: segmented_button::Entity) -> Option<&TabModel> {
         // Check focused window first to avoid entity ID collisions
@@ -888,9 +917,9 @@ impl App {
                             terminal_box.on_mouse_enter(move || Message::MouseEnter(pane));
                     }
 
-                    let context_menu = {
+                    let (context_menu, is_pinned) = {
                         let terminal = terminal.lock().unwrap();
-                        terminal.context_menu.clone()
+                        (terminal.context_menu.clone(), terminal.pinned)
                     };
 
                     let tab_element: Element<'_, Message> = match context_menu {
@@ -902,6 +931,7 @@ impl App {
                                     entity,
                                     menu_state.link,
                                     true, // extra window
+                                    is_pinned,
                                 ))
                                 .position(widget::popover::Position::Point(point))
                                 .into(),
@@ -1756,6 +1786,402 @@ impl App {
         self.config.default_profile
     }
 
+    /// Build a PaneLayoutNode from a pane_grid layout node tree.
+    fn pane_layout_from_node(
+        &self,
+        node: &cosmic::widget::pane_grid::Node,
+        pane_state: &pane_grid::State<TabModel>,
+        tab_counter: &mut usize,
+    ) -> session::PaneLayoutNode {
+        match node {
+            cosmic::widget::pane_grid::Node::Split { axis, ratio, a, b, .. } => {
+                let split_axis = match axis {
+                    pane_grid::Axis::Horizontal => session::SplitAxis::Horizontal,
+                    pane_grid::Axis::Vertical => session::SplitAxis::Vertical,
+                };
+                session::PaneLayoutNode::Split {
+                    axis: split_axis,
+                    ratio: *ratio,
+                    a: Box::new(self.pane_layout_from_node(a, pane_state, tab_counter)),
+                    b: Box::new(self.pane_layout_from_node(b, pane_state, tab_counter)),
+                }
+            }
+            cosmic::widget::pane_grid::Node::Pane(pane) => {
+                let mut tabs = Vec::new();
+                let mut active_tab = 0;
+                if let Some(tab_model) = pane_state.get(*pane) {
+                    let active_entity = tab_model.active();
+                    for (idx, entity) in tab_model.iter().enumerate() {
+                        if entity == active_entity {
+                            active_tab = idx;
+                        }
+                        let tab_title = tab_model.text(entity).unwrap_or_default().to_string();
+                        if let Some(terminal_id) = tab_model.data::<TerminalId>(entity) {
+                            if let Some(terminal) = self.terminals.get(terminal_id) {
+                                let terminal = terminal.lock().unwrap();
+                                let scrollback = terminal.full_scrollback_text(100 * 1024);
+                                let scrollback_file = session::save_scrollback(
+                                    self.session_id,
+                                    *tab_counter,
+                                    &scrollback,
+                                );
+                                tabs.push(session::TabSession {
+                                    profile_id: terminal.profile_id_opt.map(|p| p.0),
+                                    tab_title,
+                                    tab_title_override: terminal.tab_title_override.clone(),
+                                    working_directory: terminal
+                                        .current_working_directory()
+                                        .map(|p| p.to_string_lossy().into_owned()),
+                                    zoom_adj: terminal.zoom_adj(),
+                                    pinned: terminal.pinned,
+                                    scrollback_file,
+                                });
+                                *tab_counter += 1;
+                            }
+                        }
+                    }
+                }
+                session::PaneLayoutNode::Pane(session::PaneSession { tabs, active_tab })
+            }
+        }
+    }
+
+    /// Save the current session state to disk.
+    fn save_session(&self) {
+        if !self.config.session_restore {
+            return;
+        }
+
+        let mut windows = Vec::new();
+        let mut tab_counter = 0;
+
+        // Main window
+        let main_layout = self.pane_layout_from_node(
+            self.pane_model.panes.layout(),
+            &self.pane_model.panes,
+            &mut tab_counter,
+        );
+        windows.push(session::WindowSession {
+            is_main: true,
+            pane_layout: main_layout,
+        });
+
+        // Extra windows
+        for (_wid, state) in &self.extra_windows {
+            let layout = self.pane_layout_from_node(
+                state.pane_model.panes.layout(),
+                &state.pane_model.panes,
+                &mut tab_counter,
+            );
+            windows.push(session::WindowSession {
+                is_main: false,
+                pane_layout: layout,
+            });
+        }
+
+        let state = session::SessionState {
+            session_id: self.session_id,
+            pid: std::process::id(),
+            windows,
+        };
+        session::write_session(&state);
+    }
+
+    /// Try to restore an orphaned session. Returns Some(Task) if restored.
+    fn try_restore_session(&mut self) -> Option<Task<Message>> {
+        let orphaned = session::find_orphaned_sessions();
+        let sess = orphaned.into_iter().next()?;
+
+        if sess.windows.is_empty() {
+            session::cleanup_session(sess.session_id);
+            return None;
+        }
+
+        log::info!("restoring session {}", sess.session_id);
+
+        let term_event_tx = self.term_event_tx_opt.as_ref()?.clone();
+        let colors = self
+            .themes
+            .get(&self.config.syntax_theme(None))
+            .or_else(|| match self.config.color_scheme_kind() {
+                ColorSchemeKind::Dark => self
+                    .themes
+                    .get(&(config::COSMIC_THEME_DARK.to_string(), ColorSchemeKind::Dark)),
+                ColorSchemeKind::Light => self.themes.get(&(
+                    config::COSMIC_THEME_LIGHT.to_string(),
+                    ColorSchemeKind::Light,
+                )),
+            })
+            .copied()?;
+
+        let mut tasks = Vec::new();
+
+        for (win_idx, win_session) in sess.windows.iter().enumerate() {
+            if win_idx == 0 {
+                // Restore into main window
+                self.restore_pane_layout(
+                    &win_session.pane_layout,
+                    &term_event_tx,
+                    colors,
+                    sess.session_id,
+                    true,
+                );
+            } else {
+                // Create extra window and restore into it
+                let (new_id, spawn_task) = window::open(window::Settings::default());
+                let mut window_state = WindowState::new();
+                self.restore_pane_layout_into_window(
+                    &win_session.pane_layout,
+                    &term_event_tx,
+                    colors,
+                    sess.session_id,
+                    &mut window_state,
+                );
+                self.extra_windows.insert(new_id, window_state);
+                tasks.push(spawn_task.map(|id| cosmic::Action::App(Message::WindowOpened(id))));
+            }
+        }
+
+        // Clean up session metadata immediately, but defer backup file
+        // deletion so the cat-then-exec shells have time to read them.
+        session::cleanup_session_meta(sess.session_id);
+        let old_id = sess.session_id;
+        tasks.push(Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                old_id
+            },
+            |id| cosmic::Action::App(Message::CleanupBackups(id)),
+        ));
+
+        tasks.push(self.update_title(None));
+        Some(Task::batch(tasks))
+    }
+
+    /// Restore a pane layout into the main window's pane_model.
+    fn restore_pane_layout(
+        &mut self,
+        layout: &session::PaneLayoutNode,
+        term_event_tx: &mpsc::UnboundedSender<(TerminalId, TermEvent)>,
+        colors: TermColors,
+        old_session_id: u64,
+        is_main: bool,
+    ) {
+        // For now, restore as flat tabs in the existing single pane.
+        // Full pane tree reconstruction would require Configuration<T>.
+        let tabs = Self::collect_tabs_from_layout(layout);
+        if tabs.is_empty() || !is_main {
+            return;
+        }
+
+        // Pre-build all options before taking mutable borrow on pane_model
+        let prepared: Vec<_> = tabs.iter().map(|tab_sess| {
+            let profile_id_opt = tab_sess.profile_id.map(ProfileId);
+            let options = self.build_tty_options_for_restore(tab_sess, old_session_id, profile_id_opt);
+            let tab_title = if let Some(ref ovr) = tab_sess.tab_title_override {
+                ovr.clone()
+            } else if !tab_sess.tab_title.is_empty() {
+                tab_sess.tab_title.clone()
+            } else {
+                fl!("new-terminal")
+            };
+            (profile_id_opt, options, tab_title, tab_sess.tab_title_override.clone(), tab_sess.pinned)
+        }).collect();
+
+        let tab_model = match self.pane_model.active_mut() {
+            Some(tm) => tm,
+            None => return,
+        };
+
+        for (profile_id_opt, options, tab_title, title_override, pinned) in prepared {
+            let terminal_id = TerminalId::new();
+            let entity = tab_model
+                .insert()
+                .text(tab_title)
+                .closable()
+                .activate()
+                .id();
+            tab_model.data_set::<TerminalId>(entity, terminal_id);
+
+            match Terminal::new(
+                terminal_id,
+                term_event_tx.clone(),
+                self.term_config.clone(),
+                options,
+                &self.config,
+                colors,
+                profile_id_opt,
+                title_override,
+            ) {
+                Ok(mut terminal) => {
+                    terminal.set_config(&self.config, &self.themes);
+                    terminal.pinned = pinned;
+                    self.terminals.insert(terminal_id, Mutex::new(terminal));
+                }
+                Err(err) => {
+                    log::error!("failed to restore terminal: {}", err);
+                    tab_model.remove(entity);
+                }
+            }
+        }
+    }
+
+    /// Restore a pane layout into a WindowState for an extra window.
+    fn restore_pane_layout_into_window(
+        &mut self,
+        layout: &session::PaneLayoutNode,
+        term_event_tx: &mpsc::UnboundedSender<(TerminalId, TermEvent)>,
+        colors: TermColors,
+        old_session_id: u64,
+        window_state: &mut WindowState,
+    ) {
+        let tabs = Self::collect_tabs_from_layout(layout);
+        if tabs.is_empty() {
+            return;
+        }
+
+        // Pre-build options
+        let prepared: Vec<_> = tabs.iter().map(|tab_sess| {
+            let profile_id_opt = tab_sess.profile_id.map(ProfileId);
+            let options = self.build_tty_options_for_restore(tab_sess, old_session_id, profile_id_opt);
+            let tab_title = if let Some(ref ovr) = tab_sess.tab_title_override {
+                ovr.clone()
+            } else if !tab_sess.tab_title.is_empty() {
+                tab_sess.tab_title.clone()
+            } else {
+                fl!("new-terminal")
+            };
+            (profile_id_opt, options, tab_title, tab_sess.tab_title_override.clone(), tab_sess.pinned)
+        }).collect();
+
+        let tab_model = match window_state.pane_model.active_mut() {
+            Some(tm) => tm,
+            None => return,
+        };
+
+        for (profile_id_opt, options, tab_title, title_override, pinned) in prepared {
+            let terminal_id = TerminalId::new();
+            let entity = tab_model
+                .insert()
+                .text(tab_title)
+                .closable()
+                .activate()
+                .id();
+            tab_model.data_set::<TerminalId>(entity, terminal_id);
+
+            match Terminal::new(
+                terminal_id,
+                term_event_tx.clone(),
+                self.term_config.clone(),
+                options,
+                &self.config,
+                colors,
+                profile_id_opt,
+                title_override,
+            ) {
+                Ok(mut terminal) => {
+                    terminal.set_config(&self.config, &self.themes);
+                    terminal.pinned = pinned;
+                    self.terminals.insert(terminal_id, Mutex::new(terminal));
+                }
+                Err(err) => {
+                    log::error!("failed to restore terminal in extra window: {}", err);
+                    tab_model.remove(entity);
+                }
+            }
+        }
+    }
+
+    /// Flatten all tabs from a pane layout tree.
+    fn collect_tabs_from_layout(layout: &session::PaneLayoutNode) -> Vec<session::TabSession> {
+        match layout {
+            session::PaneLayoutNode::Pane(pane_sess) => pane_sess.tabs.clone(),
+            session::PaneLayoutNode::Split { a, b, .. } => {
+                let mut tabs = Self::collect_tabs_from_layout(a);
+                tabs.extend(Self::collect_tabs_from_layout(b));
+                tabs
+            }
+        }
+    }
+
+    /// Build tty::Options for restoring a tab, with cat-then-exec scrollback injection.
+    fn build_tty_options_for_restore(
+        &self,
+        tab_sess: &session::TabSession,
+        _old_session_id: u64,
+        profile_id_opt: Option<ProfileId>,
+    ) -> Options {
+        let profile_opt = profile_id_opt.and_then(|pid| self.config.profiles.get(&pid));
+
+        // Determine working directory
+        let working_directory = tab_sess
+            .working_directory
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.into())
+            .or_else(|| {
+                profile_opt
+                    .and_then(|p| (!p.working_directory.is_empty()).then(|| p.working_directory.clone().into()))
+            });
+
+        // Determine shell command
+        let original_shell = profile_opt
+            .and_then(|p| {
+                shlex::split(&p.command).and_then(|mut args| {
+                    if args.is_empty() {
+                        None
+                    } else {
+                        let cmd = args.remove(0);
+                        Some(format!("{} {}", cmd, args.join(" ")))
+                    }
+                })
+            })
+            .unwrap_or_else(|| {
+                std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string())
+            });
+
+        // Build shell with optional scrollback injection
+        let shell = if let Some(ref scrollback_file) = tab_sess.scrollback_file {
+            if let Some(path) = session::scrollback_path(scrollback_file) {
+                if path.exists() {
+                    let escaped = shlex::try_quote(&path.to_string_lossy())
+                        .unwrap_or(std::borrow::Cow::Borrowed(""))
+                        .into_owned();
+                    let cmd = format!("cat {} 2>/dev/null; exec {}", escaped, original_shell);
+                    Some(tty::Shell::new("sh".into(), vec!["-c".into(), cmd]))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let shell = shell.or_else(|| {
+            profile_opt.and_then(|p| {
+                shlex::split(&p.command).and_then(|mut args| {
+                    if args.is_empty() {
+                        None
+                    } else {
+                        let cmd = args.remove(0);
+                        Some(tty::Shell::new(cmd, args))
+                    }
+                })
+            })
+        });
+
+        let drain_on_exit = profile_opt.is_some_and(|p| p.drain_on_exit);
+
+        Options {
+            shell,
+            working_directory,
+            drain_on_exit,
+            env: HashMap::new(),
+        }
+    }
+
     fn create_and_focus_new_terminal(
         &mut self,
         pane: pane_grid::Pane,
@@ -2106,9 +2532,14 @@ impl Application for App {
             title_editing_input_id: widget::Id::unique(),
             title_ai_loading: false,
             title_ai_suggestion: None,
+            session_id: session::generate_session_id(),
+            graceful_exit: false,
             #[cfg(feature = "password_manager")]
             password_mgr: Default::default(),
         };
+
+        // Write session lock
+        session::write_lock(app.session_id);
 
         app.set_curr_font_weights_and_stretches();
         let command = Task::batch([app.update_config(), app.update_title(None)]);
@@ -2977,6 +3408,39 @@ impl Application for App {
                     }
                 }
             }
+            Message::TogglePin(entity) => {
+                // Find the terminal for this entity and toggle its pinned state
+                for (_pane, tab_model) in self.pane_model.panes.iter() {
+                    if tab_model.position(entity).is_some() {
+                        if let Some(terminal_id) = tab_model.data::<TerminalId>(entity) {
+                            if let Some(terminal) = self.terminals.get(terminal_id) {
+                                let mut terminal = terminal.lock().unwrap();
+                                terminal.pinned = !terminal.pinned;
+                            }
+                        }
+                        return Task::none();
+                    }
+                }
+                for (_wid, state) in &self.extra_windows {
+                    for (_pane, tab_model) in state.pane_model.panes.iter() {
+                        if tab_model.position(entity).is_some() {
+                            if let Some(terminal_id) = tab_model.data::<TerminalId>(entity) {
+                                if let Some(terminal) = self.terminals.get(terminal_id) {
+                                    let mut terminal = terminal.lock().unwrap();
+                                    terminal.pinned = !terminal.pinned;
+                                }
+                            }
+                            return Task::none();
+                        }
+                    }
+                }
+            }
+            Message::SessionSave => {
+                self.save_session();
+            }
+            Message::CleanupBackups(old_session_id) => {
+                session::cleanup_backups(old_session_id);
+            }
             Message::TitleEditStart => {
                 self.title_editing_value = String::new();
                 self.title_ai_suggestion = None;
@@ -3608,7 +4072,14 @@ impl Application for App {
                 // Set new terminal event channel
                 self.term_event_tx_opt = Some(term_event_tx);
 
-                // Spawn first tab
+                // Try to restore a previous session
+                if self.config.session_restore {
+                    if let Some(task) = self.try_restore_session() {
+                        return task;
+                    }
+                }
+
+                // No session to restore — spawn first tab normally
                 return self.update(Message::TabNew);
             }
             Message::ToggleContextPage(context_page) => {
@@ -3667,6 +4138,7 @@ impl Application for App {
                 config_set!(default_profile, default.then_some(profile_id));
             }
             Message::WindowClose => {
+                self.graceful_exit = true;
                 if let Some(window_id) = self.core.main_window_id() {
                     return window::close(window_id);
                 }
@@ -3750,6 +4222,12 @@ impl Application for App {
                             }
                         }
                     }
+                }
+
+                // If this was a graceful close and no windows remain, clean up session
+                if self.graceful_exit && self.extra_windows.is_empty() {
+                    session::cleanup_session(self.session_id);
+                    session::remove_lock(self.session_id);
                 }
             }
             Message::WindowFocusGained(window_id) => {
@@ -3879,18 +4357,48 @@ impl Application for App {
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
-        vec![
+        let pinned = self.is_active_tab_pinned();
+        let pin_msg = self
+            .focused_active_tab_model()
+            .map(|tm| Message::TogglePin(tm.active()));
+
+        let mut items = vec![
             widget::button::custom(icon_cache_get("edit-symbolic", 16))
                 .on_press(Message::TitleEditStart)
                 .padding(8)
                 .class(style::Button::Icon)
                 .into(),
+        ];
+
+        let mut pin_btn = widget::button::custom(icon_cache_get("pin-symbolic", 16))
+            .padding(8)
+            .class(if pinned {
+                style::Button::Suggested
+            } else {
+                style::Button::Icon
+            });
+        if let Some(msg) = pin_msg {
+            pin_btn = pin_btn.on_press(msg);
+        }
+        let pin_tooltip = if pinned {
+            fl!("unpin-terminal")
+        } else {
+            fl!("pin-terminal")
+        };
+        items.push(
+            widget::tooltip(pin_btn, widget::text::body(pin_tooltip), widget::tooltip::Position::Bottom)
+                .into(),
+        );
+
+        items.push(
             widget::button::custom(icon_cache_get("list-add-symbolic", 16))
                 .on_press(Message::TabNew)
                 .padding(8)
                 .class(style::Button::Icon)
                 .into(),
-        ]
+        );
+
+        items
     }
 
     fn view_window(&self, window_id: window::Id) -> Element<'_, Message> {
@@ -3952,9 +4460,9 @@ impl Application for App {
                     terminal_box = terminal_box.on_mouse_enter(move || Message::MouseEnter(pane));
                 }
 
-                let context_menu = {
+                let (context_menu, is_pinned) = {
                     let terminal = terminal.lock().unwrap();
-                    terminal.context_menu.clone()
+                    (terminal.context_menu.clone(), terminal.pinned)
                 };
 
                 let tab_element: Element<'_, Message> = match context_menu {
@@ -3966,6 +4474,7 @@ impl Application for App {
                                 entity,
                                 menu_state.link,
                                 false, // main window
+                                is_pinned,
                             ))
                             .position(widget::popover::Position::Point(point))
                             .into(),
@@ -4126,6 +4635,13 @@ impl Application for App {
             match &self.dialog_opt {
                 Some(dialog) => dialog.subscription(),
                 None => Subscription::none(),
+            },
+            // Periodic session save (every 30 seconds)
+            if self.config.session_restore {
+                iced::time::every(std::time::Duration::from_secs(30))
+                    .map(|_| Message::SessionSave)
+            } else {
+                Subscription::none()
             },
         ])
     }

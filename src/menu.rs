@@ -37,6 +37,7 @@ pub fn context_menu<'a>(
     entity: segmented_button::Entity,
     link: Option<String>,
     is_extra_window: bool,
+    is_pinned: bool,
 ) -> Element<'a, Message> {
     let find_key = |action: &Action| -> String {
         for (key_bind, key_action) in key_binds {
@@ -108,6 +109,12 @@ pub fn context_menu<'a>(
             ))
         },
         Element::from(menu_item(fl!("menu-settings"), Action::Settings)),
+        Element::from(divider::horizontal::light()),
+        Element::from(menu_checkbox(
+            if is_pinned { fl!("unpin-terminal") } else { fl!("pin-terminal") },
+            is_pinned,
+            Action::TogglePin,
+        )),
     ];
     #[cfg(feature = "password_manager")]
     {
