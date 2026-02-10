@@ -474,6 +474,30 @@ impl Terminal {
         }
     }
 
+    /// Extract visible viewport text as a single string (one line per terminal row).
+    pub fn visible_text(&self) -> String {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let cols = grid.columns();
+        let lines = grid.screen_lines();
+        let mut result = String::with_capacity(cols * lines);
+        for line_idx in 0..lines {
+            let row = &grid[Line(line_idx as i32)];
+            let mut line_text = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &row[Column(col)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                line_text.push(cell.c);
+            }
+            // Trim trailing whitespace per line
+            result.push_str(line_text.trim_end());
+            result.push('\n');
+        }
+        result
+    }
+
     pub fn search(&mut self, value: &str, forwards: bool) {
         //TODO: set max lines, run in thread?
         {

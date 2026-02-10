@@ -66,6 +66,8 @@ use crate::dnd::DndDrop;
 use crate::menu::MenuState;
 mod terminal_box;
 
+mod ai;
+
 #[cfg(feature = "password_manager")]
 mod password_manager;
 mod terminal_theme;
@@ -429,6 +431,12 @@ pub enum Message {
     UseBrightBold(bool),
     TabAttachToMainWindow(segmented_button::Entity),
     TabDetachToWindow(segmented_button::Entity),
+    TitleEditStart,
+    TitleEditChanged(String),
+    TitleEditSubmit,
+    TitleEditCancel,
+    TitleAiSuggest,
+    TitleAiResult(Option<String>),
     WindowClose,
     WindowFocusGained(window::Id),
     WindowNew,
@@ -496,6 +504,10 @@ pub struct App {
     profile_expanded: Option<ProfileId>,
     show_advanced_font_settings: bool,
     modifiers: Modifiers,
+    title_editing: bool,
+    title_editing_value: String,
+    title_editing_input_id: widget::Id,
+    title_ai_loading: bool,
     #[cfg(feature = "password_manager")]
     password_mgr: password_manager::PasswordManager,
 }
@@ -2088,6 +2100,10 @@ impl Application for App {
             profile_expanded: None,
             show_advanced_font_settings: false,
             modifiers: Modifiers::empty(),
+            title_editing: false,
+            title_editing_value: String::new(),
+            title_editing_input_id: widget::Id::unique(),
+            title_ai_loading: false,
             #[cfg(feature = "password_manager")]
             password_mgr: Default::default(),
         };
@@ -2617,6 +2633,14 @@ impl Application for App {
                 config_set!(focus_follow_mouse, focus_follow_mouse);
             }
             Message::Key(modifiers, key) => {
+                // Intercept Escape during title editing
+                if self.title_editing {
+                    if key == Key::Named(iced::keyboard::key::Named::Escape) {
+                        return self.update(Message::TitleEditCancel);
+                    }
+                    // Don't process other keybinds while editing title
+                    return Task::none();
+                }
                 for (key_bind, action) in &self.key_binds {
                     if key_bind.matches(modifiers, &key) {
                         return self.update(action.message(None));
@@ -2933,6 +2957,68 @@ impl Application for App {
                     None => {
                         log::warn!("failed to find syntax theme with index {}", index);
                     }
+                }
+            }
+            Message::TitleEditStart => {
+                let current_title = self.core.window.header_title.clone();
+                self.title_editing_value = current_title;
+                self.title_editing = true;
+                return widget::text_input::focus(self.title_editing_input_id.clone());
+            }
+            Message::TitleEditChanged(value) => {
+                self.title_editing_value = value;
+            }
+            Message::TitleEditSubmit => {
+                self.title_editing = false;
+                let title = self.title_editing_value.clone();
+                if !title.is_empty() {
+                    // Set the title override on the active terminal
+                    if let Some(tab_model) = self.focused_active_tab_model() {
+                        let entity = tab_model.active();
+                        if let Some(terminal_id) = tab_model.data::<TerminalId>(entity).copied() {
+                            if let Some(terminal) = self.terminals.get(&terminal_id) {
+                                let mut terminal = terminal.lock().unwrap();
+                                terminal.tab_title_override = Some(title.clone());
+                            }
+                        }
+                    }
+                    // Update tab text and window title
+                    if let Some(tab_model) = self.focused_active_tab_model_mut() {
+                        let entity = tab_model.active();
+                        tab_model.text_set(entity, title);
+                    }
+                    return self.update_title(None);
+                }
+            }
+            Message::TitleEditCancel => {
+                self.title_editing = false;
+            }
+            Message::TitleAiSuggest => {
+                self.title_ai_loading = true;
+                let content = if let Some(tab_model) = self.focused_active_tab_model() {
+                    let entity = tab_model.active();
+                    if let Some(terminal_id) = tab_model.data::<TerminalId>(entity) {
+                        if let Some(terminal) = self.terminals.get(terminal_id) {
+                            let terminal = terminal.lock().unwrap();
+                            terminal.visible_text()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                return Task::perform(
+                    async move { ai::suggest_terminal_title(&content).await },
+                    |result| cosmic::Action::App(Message::TitleAiResult(result)),
+                );
+            }
+            Message::TitleAiResult(suggestion) => {
+                self.title_ai_loading = false;
+                if let Some(title) = suggestion {
+                    self.title_editing_value = title;
                 }
             }
             Message::TabAttachToMainWindow(entity) => {
@@ -3673,6 +3759,63 @@ impl Application for App {
 
     fn header_start(&self) -> Vec<Element<'_, Self::Message>> {
         vec![menu_bar(&self.core, &self.config, &self.key_binds)]
+    }
+
+    fn header_center(&self) -> Vec<Element<'_, Self::Message>> {
+        if self.title_editing {
+            let mut row_children: Vec<Element<'_, Message>> = vec![
+                widget::text_input(fl!("title-edit-placeholder"), &self.title_editing_value)
+                    .id(self.title_editing_input_id.clone())
+                    .on_input(Message::TitleEditChanged)
+                    .on_submit(|_| Message::TitleEditSubmit)
+                    .width(Length::Fixed(300.0))
+                    .into(),
+            ];
+
+            // AI suggest button (only if API key is available)
+            if ai::get_api_key().is_some() {
+                let ai_label = if self.title_ai_loading {
+                    fl!("title-ai-loading")
+                } else {
+                    fl!("title-ai-suggest")
+                };
+                let mut ai_btn = widget::button::custom(widget::text(ai_label).size(12))
+                    .padding([4, 8])
+                    .class(style::Button::HeaderBar);
+                if !self.title_ai_loading {
+                    ai_btn = ai_btn.on_press(Message::TitleAiSuggest);
+                }
+                row_children.push(ai_btn.into());
+            }
+
+            // Cancel button
+            row_children.push(
+                widget::button::custom(icon_cache_get("window-close-symbolic", 14))
+                    .on_press(Message::TitleEditCancel)
+                    .padding(4)
+                    .class(style::Button::HeaderBar)
+                    .into(),
+            );
+
+            vec![widget::row::with_children(row_children)
+                .spacing(4)
+                .align_y(Alignment::Center)
+                .into()]
+        } else {
+            let title = self.core.window.header_title.clone();
+            vec![widget::button::custom(
+                widget::text(if title.is_empty() {
+                    fl!("cosmic-terminal")
+                } else {
+                    title
+                })
+                .size(14),
+            )
+            .on_press(Message::TitleEditStart)
+            .padding([4, 12])
+            .class(style::Button::HeaderBar)
+            .into()]
+        }
     }
 
     fn header_end(&self) -> Vec<Element<'_, Self::Message>> {
