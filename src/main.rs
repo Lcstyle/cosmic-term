@@ -549,25 +549,26 @@ impl App {
         terminal_for_entity(&self.terminals, tab_model, entity)
     }
 
-    /// Find which pane/entity a terminal is displayed in (searches all windows)
+    /// Find which pane/entity a terminal is displayed in (searches all windows).
+    /// Returns (window_id, pane, entity) where window_id is None for the main window.
     fn find_terminal_location(
         &self,
         id: TerminalId,
-    ) -> Option<(pane_grid::Pane, segmented_button::Entity)> {
+    ) -> Option<(Option<window::Id>, pane_grid::Pane, segmented_button::Entity)> {
         // Search main window
         for (pane, tab_model) in self.pane_model.panes.panes.iter() {
             for entity in tab_model.iter() {
                 if tab_model.data::<TerminalId>(entity) == Some(&id) {
-                    return Some((*pane, entity));
+                    return Some((None, *pane, entity));
                 }
             }
         }
         // Search extra windows
-        for (_wid, state) in &self.extra_windows {
+        for (wid, state) in &self.extra_windows {
             for (pane, tab_model) in state.pane_model.panes.panes.iter() {
                 for entity in tab_model.iter() {
                     if tab_model.data::<TerminalId>(entity) == Some(&id) {
-                        return Some((*pane, entity));
+                        return Some((Some(*wid), *pane, entity));
                     }
                 }
             }
@@ -575,25 +576,69 @@ impl App {
         None
     }
 
+    /// Get the correct tab model for a given window+pane combination (mutable).
+    fn tab_model_in_window_mut(
+        &mut self,
+        window_id: Option<window::Id>,
+        pane: pane_grid::Pane,
+    ) -> Option<&mut TabModel> {
+        match window_id {
+            Some(wid) => self
+                .extra_windows
+                .get_mut(&wid)
+                .and_then(|s| s.pane_model.panes.get_mut(pane)),
+            None => self.pane_model.panes.get_mut(pane),
+        }
+    }
+
     fn update_terminal_focus(&self) {
-        let focused_pane = self.pane_model.focused();
+        let is_main_focused = self.focused_window_id.is_none();
+        let focused_main_pane = self.pane_model.focused();
+
+        // Main window panes
         for (pane, tab_model) in self.pane_model.panes.panes.iter() {
             let entity = tab_model.active();
             if let Some(terminal) = self.terminal_for_entity(tab_model, entity) {
                 let mut terminal = terminal.lock().unwrap();
-                terminal.is_focused = focused_pane == *pane;
+                terminal.is_focused = is_main_focused && focused_main_pane == *pane;
                 terminal.update();
+            }
+        }
+
+        // Extra window panes
+        for (wid, state) in &self.extra_windows {
+            let is_this_window_focused = self.focused_window_id == Some(*wid);
+            let focused_extra_pane = state.pane_model.focused();
+            for (pane, tab_model) in state.pane_model.panes.panes.iter() {
+                let entity = tab_model.active();
+                if let Some(terminal) = self.terminal_for_entity(tab_model, entity) {
+                    let mut terminal = terminal.lock().unwrap();
+                    terminal.is_focused = is_this_window_focused && focused_extra_pane == *pane;
+                    terminal.update();
+                }
             }
         }
     }
 
     fn unfocus_all_terminals(&self) {
+        // Main window
         for (_pane, tab_model) in self.pane_model.panes.panes.iter() {
             let entity = tab_model.active();
             if let Some(terminal) = self.terminal_for_entity(tab_model, entity) {
                 let mut terminal = terminal.lock().unwrap();
                 terminal.is_focused = false;
                 terminal.update();
+            }
+        }
+        // Extra windows
+        for (_wid, state) in &self.extra_windows {
+            for (_pane, tab_model) in state.pane_model.panes.panes.iter() {
+                let entity = tab_model.active();
+                if let Some(terminal) = self.terminal_for_entity(tab_model, entity) {
+                    let mut terminal = terminal.lock().unwrap();
+                    terminal.is_focused = false;
+                    terminal.update();
+                }
             }
         }
     }
@@ -3318,7 +3363,7 @@ impl Application for App {
                         //TODO: should we blink the cursor?
                     }
                     TermEvent::Exit => {
-                        if let Some((_pane, entity)) = location {
+                        if let Some((_window_id, _pane, entity)) = location {
                             return self.update(Message::TabClose(Some(entity)));
                         }
                     }
@@ -3329,7 +3374,7 @@ impl Application for App {
                         }
                     }
                     TermEvent::ResetTitle => {
-                        if let Some((pane, entity)) = location {
+                        if let Some((window_id, pane, entity)) = location {
                             let tab_title_override =
                                 if let Some(terminal) = self.terminals.get(&terminal_id) {
                                     let terminal = terminal.lock().unwrap();
@@ -3337,7 +3382,7 @@ impl Application for App {
                                 } else {
                                     None
                                 };
-                            if let Some(tab_model) = self.pane_model.panes.get_mut(pane) {
+                            if let Some(tab_model) = self.tab_model_in_window_mut(window_id, pane) {
                                 tab_model.text_set(
                                     entity,
                                     tab_title_override.unwrap_or_else(|| fl!("new-terminal")),
@@ -3354,7 +3399,7 @@ impl Application for App {
                         }
                     }
                     TermEvent::Title(title) => {
-                        if let Some((pane, entity)) = location {
+                        if let Some((window_id, pane, entity)) = location {
                             let has_override =
                                 if let Some(terminal) = self.terminals.get(&terminal_id) {
                                     let terminal = terminal.lock().unwrap();
@@ -3363,7 +3408,7 @@ impl Application for App {
                                     false
                                 };
                             if !has_override {
-                                if let Some(tab_model) = self.pane_model.panes.get_mut(pane) {
+                                if let Some(tab_model) = self.tab_model_in_window_mut(window_id, pane) {
                                     tab_model.text_set(entity, title);
                                 }
                             }
@@ -3482,6 +3527,15 @@ impl Application for App {
                 });
             }
             Message::WindowOpened(window_id) => {
+                // Skip if window was pre-populated (e.g., from TabDetachToWindow)
+                if let Some(state) = self.extra_windows.get(&window_id) {
+                    let has_terminals = state.pane_model.panes.panes.iter()
+                        .any(|(_p, tm)| tm.iter().any(|e| tm.data::<TerminalId>(e).is_some()));
+                    if has_terminals {
+                        return Task::none();
+                    }
+                }
+
                 // Create first terminal tab in the new window
                 // First gather data without mutable borrow
                 let profile_id_opt = self.get_default_profile();
