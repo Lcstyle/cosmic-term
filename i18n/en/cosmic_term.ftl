@@ -113,6 +113,8 @@ title-ai-loading = Suggesting...
 # Session & Pin
 pin-terminal = Pin Terminal
 unpin-terminal = Unpin Terminal
+clear-session = Clear session backup
+clear-all-sessions = Clear all session backups
 
 # Password Manager
 menu-password-manager = Passwords...

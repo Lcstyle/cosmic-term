@@ -223,6 +223,8 @@ pub struct Flags {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     About,
+    ClearSessionBackup,
+    ClearAllSessionBackups,
     ClearScrollback,
     ColorSchemes(ColorSchemeKind),
     Copy,
@@ -275,6 +277,8 @@ impl Action {
     fn message(&self, entity_opt: Option<segmented_button::Entity>) -> Message {
         match self {
             Self::About => Message::ToggleContextPage(ContextPage::About),
+            Self::ClearSessionBackup => Message::SessionClear,
+            Self::ClearAllSessionBackups => Message::SessionClearAll,
             Self::ClearScrollback => Message::ClearScrollback(entity_opt),
             Self::ColorSchemes(color_scheme_kind) => {
                 Message::ToggleContextPage(ContextPage::ColorSchemes(*color_scheme_kind))
@@ -448,6 +452,8 @@ pub enum Message {
     TitleAiResult(Option<String>),
     TogglePin(segmented_button::Entity),
     SessionSave,
+    SessionClear,
+    SessionClearAll,
     CleanupBackups(Vec<u64>),
     WindowClose,
     WindowFocusGained(window::Id),
@@ -3470,6 +3476,14 @@ impl Application for App {
             }
             Message::SessionSave => {
                 self.save_session();
+            }
+            Message::SessionClear => {
+                log::info!("clearing session backup for {}", self.session_id);
+                session::cleanup_session(self.session_id);
+            }
+            Message::SessionClearAll => {
+                log::info!("clearing all session backups");
+                session::cleanup_all_sessions();
             }
             Message::CleanupBackups(session_ids) => {
                 for id in session_ids {

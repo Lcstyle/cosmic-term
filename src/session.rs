@@ -193,6 +193,24 @@ pub fn cleanup_backups(session_id: u64) {
     }
 }
 
+/// Delete all session files, lock files, and backup files.
+pub fn cleanup_all_sessions() {
+    if let Some(dir) = session_dir() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    if let Some(dir) = backup_dir() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 /// Save scrollback text for one tab, capped at MAX_SCROLLBACK_BYTES.
 pub fn save_scrollback(session_id: u64, tab_idx: usize, content: &str) -> Option<String> {
     let dir = backup_dir()?;
