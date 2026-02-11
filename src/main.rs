@@ -4356,14 +4356,6 @@ impl Application for App {
             .focused_active_tab_model()
             .map(|tm| Message::TogglePin(tm.active()));
 
-        let mut items = vec![
-            widget::button::custom(icon_cache_get("edit-symbolic", 16))
-                .on_press(Message::TitleEditStart)
-                .padding(8)
-                .class(style::Button::Icon)
-                .into(),
-        ];
-
         let mut pin_btn = widget::button::custom(icon_cache_get("pin-symbolic", 16))
             .padding(8)
             .class(if pinned {
@@ -4379,20 +4371,32 @@ impl Application for App {
         } else {
             fl!("pin-terminal")
         };
-        items.push(
-            widget::tooltip(pin_btn, widget::text::body(pin_tooltip), widget::tooltip::Position::Bottom)
-                .into(),
-        );
 
-        items.push(
+        // Pack all custom buttons into a single element so the header bar
+        // treats them as one unit, preserving space for window controls
+        // (minimize, maximize, close) which are always appended last.
+        let buttons_row = widget::row::with_children(vec![
+            widget::button::custom(icon_cache_get("edit-symbolic", 16))
+                .on_press(Message::TitleEditStart)
+                .padding(8)
+                .class(style::Button::Icon)
+                .into(),
+            widget::tooltip(
+                pin_btn,
+                widget::text::body(pin_tooltip),
+                widget::tooltip::Position::Bottom,
+            )
+            .into(),
             widget::button::custom(icon_cache_get("list-add-symbolic", 16))
                 .on_press(Message::TabNew)
                 .padding(8)
                 .class(style::Button::Icon)
                 .into(),
-        );
+        ])
+        .spacing(4)
+        .into();
 
-        items
+        vec![buttons_row]
     }
 
     fn view_window(&self, window_id: window::Id) -> Element<'_, Message> {
@@ -4467,7 +4471,7 @@ impl Application for App {
                                 &self.key_binds,
                                 entity,
                                 menu_state.link,
-                                false, // main window
+                                false,
                                 is_pinned,
                             ))
                             .position(widget::popover::Position::Point(point))

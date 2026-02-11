@@ -27,6 +27,7 @@ static MENU_ID: LazyLock<cosmic::widget::Id> =
 
 #[derive(Debug, Clone)]
 pub struct MenuState {
+    /// Cursor position relative to the terminal_box widget.
     pub position: Option<Point>,
     pub link: Option<String>,
 }
