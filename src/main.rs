@@ -1915,6 +1915,41 @@ impl App {
         session::write_lock(self.session_id);
     }
 
+    /// On graceful exit, save only pinned terminals so they restore on next
+    /// launch. If no pinned terminals exist, wipe the session entirely.
+    fn save_pinned_or_cleanup(&self) {
+        // Do a full save first (captures scrollback for pinned tabs)
+        self.save_session();
+
+        // Read back what we just saved and filter to pinned only
+        if let Some(full_state) = session::read_session(self.session_id) {
+            if let Some(pinned_state) = full_state.pinned_only() {
+                // Collect scrollback filenames referenced by pinned tabs
+                let pinned_files: std::collections::HashSet<String> = pinned_state.windows.iter()
+                    .flat_map(|w| Self::collect_tabs_from_layout(&w.pane_layout))
+                    .filter_map(|t| t.scrollback_file)
+                    .collect();
+
+                log::info!(
+                    "graceful exit: saving {} pinned tab(s) for restore",
+                    pinned_files.len()
+                );
+
+                // Overwrite session with pinned-only version
+                session::write_session(&pinned_state);
+                // Remove lock so it appears orphaned on next launch
+                session::remove_lock(self.session_id);
+                // Clean up scrollback files NOT referenced by pinned tabs
+                session::cleanup_backups_except(self.session_id, &pinned_files);
+                return;
+            }
+        }
+
+        // No pinned tabs — clean up everything
+        session::cleanup_session(self.session_id);
+        session::remove_lock(self.session_id);
+    }
+
     /// Try to restore an orphaned session. Returns Some(Task) if restored.
     ///
     /// Each orphaned session (= one previous process) is restored into its own
@@ -4273,10 +4308,10 @@ impl Application for App {
                     }
                 }
 
-                // If this was a graceful close and no windows remain, clean up session
+                // If this was a graceful close and no windows remain, save
+                // pinned tabs for restore (or clean up if none are pinned)
                 if self.graceful_exit && self.extra_windows.is_empty() {
-                    session::cleanup_session(self.session_id);
-                    session::remove_lock(self.session_id);
+                    self.save_pinned_or_cleanup();
                 }
             }
             Message::WindowFocusGained(window_id) => {

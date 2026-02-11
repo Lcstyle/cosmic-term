@@ -57,6 +57,66 @@ pub struct TabSession {
     pub scrollback_file: Option<String>,
 }
 
+impl PaneLayoutNode {
+    /// Return a filtered copy keeping only pinned tabs. Returns None if no
+    /// pinned tabs remain in this subtree.
+    pub fn pinned_only(&self) -> Option<Self> {
+        match self {
+            PaneLayoutNode::Pane(pane) => {
+                let pinned_tabs: Vec<_> = pane.tabs.iter()
+                    .filter(|t| t.pinned)
+                    .cloned()
+                    .collect();
+                if pinned_tabs.is_empty() {
+                    None
+                } else {
+                    let active_tab = pinned_tabs.len().saturating_sub(1).min(pane.active_tab);
+                    Some(PaneLayoutNode::Pane(PaneSession {
+                        tabs: pinned_tabs,
+                        active_tab,
+                    }))
+                }
+            }
+            PaneLayoutNode::Split { axis, ratio, a, b } => {
+                match (a.pinned_only(), b.pinned_only()) {
+                    (Some(a), Some(b)) => Some(PaneLayoutNode::Split {
+                        axis: *axis,
+                        ratio: *ratio,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                    }),
+                    (Some(node), None) | (None, Some(node)) => Some(node),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
+}
+
+impl SessionState {
+    /// Return a copy containing only pinned tabs. Returns None if no pinned
+    /// tabs exist in any window.
+    pub fn pinned_only(&self) -> Option<Self> {
+        let windows: Vec<_> = self.windows.iter()
+            .filter_map(|w| {
+                w.pane_layout.pinned_only().map(|layout| WindowSession {
+                    is_main: w.is_main,
+                    pane_layout: layout,
+                })
+            })
+            .collect();
+        if windows.is_empty() {
+            None
+        } else {
+            Some(SessionState {
+                session_id: self.session_id,
+                pid: self.pid,
+                windows,
+            })
+        }
+    }
+}
+
 /// Maximum scrollback text to save per terminal (100 KB).
 const MAX_SCROLLBACK_BYTES: usize = 100 * 1024;
 
@@ -185,6 +245,22 @@ pub fn cleanup_backups(session_id: u64) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     if name.starts_with(&prefix) {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Delete backup files for a session EXCEPT those in the keep set.
+pub fn cleanup_backups_except(session_id: u64, keep: &std::collections::HashSet<String>) {
+    if let Some(dir) = backup_dir() {
+        let prefix = format!("{session_id}_");
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.starts_with(&prefix) && !keep.contains(name) {
                         let _ = fs::remove_file(entry.path());
                     }
                 }
