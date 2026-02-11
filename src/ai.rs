@@ -83,14 +83,23 @@ pub async fn suggest_terminal_title(content: &str) -> Option<String> {
     ));
     request.add_user(misanthropy::Content::text(truncated));
 
-    match client.messages(&request).await {
-        Ok(response) => {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.messages(&request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => {
             let text = response.format_content();
             let title = sanitize_title(&text);
             if title.is_empty() { None } else { Some(title) }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::warn!("AI title suggestion failed: {e}");
+            None
+        }
+        Err(_) => {
+            log::warn!("AI title suggestion timed out after 10s");
             None
         }
     }
