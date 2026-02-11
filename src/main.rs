@@ -831,11 +831,24 @@ impl App {
         false
     }
 
-    /// Get the tab model containing a specific entity (searches all windows, focused first)
+    /// Get the tab model containing a specific entity (searches all windows, focused pane first).
+    ///
+    /// Entity IDs can collide across pane tab models (each segmented_button::Model
+    /// assigns IDs independently). To resolve collisions, we always check the
+    /// focused pane first — since context menu actions and keyboard shortcuts
+    /// target the focused pane, this gives the correct result.
     fn tab_model_for_entity(&self, entity: segmented_button::Entity) -> Option<&TabModel> {
         // Check focused window first to avoid entity ID collisions
         if let Some(wid) = self.focused_window_id {
             if let Some(state) = self.extra_windows.get(&wid) {
+                // Check focused pane first within this window
+                let focused = state.pane_model.focused();
+                if let Some(tab_model) = state.pane_model.panes.get(focused) {
+                    if tab_model.position(entity).is_some() {
+                        return Some(tab_model);
+                    }
+                }
+                // Then check other panes
                 for (_pane, tab_model) in state.pane_model.panes.panes.iter() {
                     if tab_model.position(entity).is_some() {
                         return Some(tab_model);
@@ -843,7 +856,14 @@ impl App {
                 }
             }
         }
-        // Check main window
+        // Check main window — focused pane first
+        let focused_main = self.pane_model.focused();
+        if let Some(tab_model) = self.pane_model.panes.get(focused_main) {
+            if tab_model.position(entity).is_some() {
+                return Some(tab_model);
+            }
+        }
+        // Then other main window panes
         for (_pane, tab_model) in self.pane_model.panes.panes.iter() {
             if tab_model.position(entity).is_some() {
                 return Some(tab_model);
