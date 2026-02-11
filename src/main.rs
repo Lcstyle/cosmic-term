@@ -1909,19 +1909,69 @@ impl App {
         session::write_lock(self.session_id);
     }
 
-    /// Try to restore orphaned sessions. Returns Some(Task) if restored.
+    /// Try to restore an orphaned session. Returns Some(Task) if restored.
     ///
-    /// All orphaned sessions are restored within this single process:
-    /// the first session's main window populates our main window, and any
-    /// extra windows (from tab-detach) are restored as iced sub-windows.
-    /// This preserves the invariant that extra windows are always sub-windows
-    /// of the same process, so tab reattach works after restore.
+    /// Each orphaned session (= one previous process) is restored into its own
+    /// process. This process claims one session: main window populates our main
+    /// window, extra windows (from tab-detach) become iced sub-windows so tab
+    /// reattach works. Remaining orphaned sessions are spawned as separate
+    /// cosmic-term processes, each restoring their own windows the same way.
     fn try_restore_session(&mut self) -> Option<Task<Message>> {
-        // Find all orphaned sessions
-        let orphaned = session::find_orphaned_sessions();
-        if orphaned.is_empty() {
-            return None;
-        }
+        // Check if we were spawned to restore a specific session
+        let targeted_id = std::env::var("COSMIC_TERM_RESTORE_SESSION")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+
+        // Clear the env var so child shells don't inherit it
+        // SAFETY: no other threads are reading this env var at this point in startup
+        unsafe { std::env::remove_var("COSMIC_TERM_RESTORE_SESSION") };
+
+        let sess = if let Some(target_id) = targeted_id {
+            // We were spawned to restore a specific session
+            let s = session::read_session(target_id)?;
+            if s.windows.is_empty() {
+                session::cleanup_session(s.session_id);
+                return None;
+            }
+            s
+        } else {
+            // Find all orphaned sessions
+            let mut orphaned = session::find_orphaned_sessions();
+            if orphaned.is_empty() {
+                return None;
+            }
+
+            // Claim the first session for this process
+            let first = orphaned.remove(0);
+
+            // Spawn a new process for each remaining orphaned session
+            for remaining in &orphaned {
+                if remaining.windows.is_empty() {
+                    session::cleanup_session(remaining.session_id);
+                    continue;
+                }
+                log::info!(
+                    "spawning new process to restore session {}",
+                    remaining.session_id
+                );
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe)
+                        .env(
+                            "COSMIC_TERM_RESTORE_SESSION",
+                            remaining.session_id.to_string(),
+                        )
+                        .spawn();
+                }
+            }
+
+            if first.windows.is_empty() {
+                session::cleanup_session(first.session_id);
+                return None;
+            }
+            first
+        };
+
+        log::info!("restoring session {}", sess.session_id);
 
         let term_event_tx = self.term_event_tx_opt.as_ref()?.clone();
         let colors = self
@@ -1939,82 +1989,67 @@ impl App {
             .copied()?;
 
         let mut tasks = Vec::new();
-        let mut cleanup_ids = Vec::new();
         let mut main_restored = false;
 
-        for sess in &orphaned {
-            if sess.windows.is_empty() {
-                session::cleanup_session(sess.session_id);
+        for win_session in &sess.windows {
+            // Pre-build options while borrowing &self (no pane_model conflict)
+            let prepared = self.prepare_tab_restore(
+                &win_session.pane_layout,
+                sess.session_id,
+            );
+            if prepared.is_empty() {
                 continue;
             }
 
-            log::info!("restoring session {}", sess.session_id);
-
-            for win_session in &sess.windows {
-                // Pre-build options while borrowing &self (no pane_model conflict)
-                let prepared = self.prepare_tab_restore(
-                    &win_session.pane_layout,
-                    sess.session_id,
-                );
-                if prepared.is_empty() {
-                    continue;
-                }
-
-                if win_session.is_main && !main_restored {
-                    // Restore into our main window's active pane.
-                    // Split borrows: pane_model vs terminals vs config fields.
-                    if let Some(tab_model) = self.pane_model.active_mut() {
-                        Self::populate_restored_tabs(
-                            tab_model,
-                            &mut self.terminals,
-                            prepared,
-                            &term_event_tx,
-                            &self.term_config,
-                            &self.config,
-                            colors,
-                            &self.themes,
-                        );
-                    }
-                    main_restored = true;
-                } else {
-                    // Restore as an iced sub-window (same invariant as tab-detach)
-                    let (new_window_id, spawn_task) =
-                        window::open(window::Settings::default());
-
-                    let mut new_state = WindowState::new();
-                    if let Some(tab_model) = new_state.pane_model.active_mut() {
-                        Self::populate_restored_tabs(
-                            tab_model,
-                            &mut self.terminals,
-                            prepared,
-                            &term_event_tx,
-                            &self.term_config,
-                            &self.config,
-                            colors,
-                            &self.themes,
-                        );
-                    }
-                    self.extra_windows.insert(new_window_id, new_state);
-                    tasks.push(
-                        spawn_task
-                            .map(|_id| cosmic::Action::App(Message::WindowFocused)),
+            if win_session.is_main && !main_restored {
+                // Restore into our main window's active pane.
+                // Split borrows: pane_model vs terminals vs config fields.
+                if let Some(tab_model) = self.pane_model.active_mut() {
+                    Self::populate_restored_tabs(
+                        tab_model,
+                        &mut self.terminals,
+                        prepared,
+                        &term_event_tx,
+                        &self.term_config,
+                        &self.config,
+                        colors,
+                        &self.themes,
                     );
                 }
+                main_restored = true;
+            } else {
+                // Restore as an iced sub-window (same invariant as tab-detach)
+                let (new_window_id, spawn_task) =
+                    window::open(window::Settings::default());
+
+                let mut new_state = WindowState::new();
+                if let Some(tab_model) = new_state.pane_model.active_mut() {
+                    Self::populate_restored_tabs(
+                        tab_model,
+                        &mut self.terminals,
+                        prepared,
+                        &term_event_tx,
+                        &self.term_config,
+                        &self.config,
+                        colors,
+                        &self.themes,
+                    );
+                }
+                self.extra_windows.insert(new_window_id, new_state);
+                tasks.push(
+                    spawn_task
+                        .map(|_id| cosmic::Action::App(Message::WindowFocused)),
+                );
             }
-
-            // Clean up session metadata immediately, defer backup file deletion
-            session::cleanup_session_meta(sess.session_id);
-            cleanup_ids.push(sess.session_id);
         }
 
-        if cleanup_ids.is_empty() {
-            return None;
-        }
-
+        // Clean up session metadata immediately, defer backup file deletion
+        session::cleanup_session_meta(sess.session_id);
+        let old_id = sess.session_id;
         let cleanup_task = Task::perform(
             async move {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                cleanup_ids
+                vec![old_id]
             },
             |ids| cosmic::Action::App(Message::CleanupBackups(ids)),
         );
