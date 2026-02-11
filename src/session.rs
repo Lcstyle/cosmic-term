@@ -198,7 +198,33 @@ pub fn is_lock_active(session_id: u64) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Check if any other cosmic-term process has an active session lock.
+/// Used to determine if this is the first launch (restore) vs. additional window (fresh).
+pub fn any_other_instance_running() -> bool {
+    let Some(dir) = session_dir() else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return false;
+    };
+    let my_pid = std::process::id() as i32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "lock") {
+            if let Ok(contents) = fs::read_to_string(&path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    if pid != my_pid && unsafe { libc::kill(pid, 0) == 0 } {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Find orphaned sessions (session files whose lock PIDs are no longer alive).
+/// Also cleans up stale lock files that have no corresponding JSON.
 pub fn find_orphaned_sessions() -> Vec<SessionState> {
     let Some(dir) = session_dir() else {
         return Vec::new();
@@ -217,6 +243,15 @@ pub fn find_orphaned_sessions() -> Vec<SessionState> {
                     if let Some(state) = read_session(session_id) {
                         sessions.push(state);
                     }
+                }
+            }
+        } else if path.extension().is_some_and(|e| e == "lock") {
+            // Clean up stale lock files with no corresponding JSON
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if let Ok(session_id) = stem.parse::<u64>() {
+                let json_path = dir.join(format!("{session_id}.json"));
+                if !json_path.exists() && !is_lock_active(session_id) {
+                    let _ = fs::remove_file(&path);
                 }
             }
         }

@@ -2177,7 +2177,10 @@ impl App {
     /// reattach works. Remaining orphaned sessions are spawned as separate
     /// cosmic-term processes, each restoring their own windows the same way.
     fn try_restore_session(&mut self) -> Option<Task<Message>> {
-        // Check if we were spawned to restore a specific session
+        // Only restore if this is the first cosmic-term instance.
+        // If other instances are already running, this is just a new window request.
+        // Exception: if we were explicitly spawned to restore a specific session
+        // (from another instance's restore flow).
         let targeted_id = std::env::var("COSMIC_TERM_RESTORE_SESSION")
             .ok()
             .and_then(|s| s.parse::<u64>().ok());
@@ -2185,6 +2188,11 @@ impl App {
         // Clear the env var so child shells don't inherit it
         // SAFETY: no other threads are reading this env var at this point in startup
         unsafe { std::env::remove_var("COSMIC_TERM_RESTORE_SESSION") };
+
+        if targeted_id.is_none() && session::any_other_instance_running() {
+            log::info!("other cosmic-term instances running, skipping session restore");
+            return None;
+        }
 
         let sess = if let Some(target_id) = targeted_id {
             // We were spawned to restore a specific session
