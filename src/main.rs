@@ -448,7 +448,7 @@ pub enum Message {
     TitleAiResult(Option<String>),
     TogglePin(segmented_button::Entity),
     SessionSave,
-    CleanupBackups(u64),
+    CleanupBackups(Vec<u64>),
     WindowClose,
     WindowFocusGained(window::Id),
     WindowNew,
@@ -1905,17 +1905,73 @@ impl App {
             windows,
         };
         session::write_session(&state);
+        // Refresh the lock file on every save so it's resilient to deletion
+        session::write_lock(self.session_id);
     }
 
     /// Try to restore an orphaned session. Returns Some(Task) if restored.
+    ///
+    /// COSMIC desktop launches a separate process per terminal window, so each
+    /// orphaned session represents one previous window. This process restores
+    /// one session into its own main window, then spawns additional cosmic-term
+    /// processes for the remaining orphaned sessions.
     fn try_restore_session(&mut self) -> Option<Task<Message>> {
-        let orphaned = session::find_orphaned_sessions();
-        let sess = orphaned.into_iter().next()?;
+        // Check if we were spawned to restore a specific session
+        let targeted_id = std::env::var("COSMIC_TERM_RESTORE_SESSION")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
 
-        if sess.windows.is_empty() {
-            session::cleanup_session(sess.session_id);
-            return None;
-        }
+        // Clear the env var so terminals spawned from this process don't inherit it
+        // SAFETY: no other threads are reading this env var at this point in startup
+        unsafe { std::env::remove_var("COSMIC_TERM_RESTORE_SESSION") };
+
+        let sess = if let Some(target_id) = targeted_id {
+            // We were spawned to restore a specific session
+            let s = session::read_session(target_id)?;
+            if s.windows.is_empty() {
+                session::cleanup_session(s.session_id);
+                return None;
+            }
+            s
+        } else {
+            // Find all orphaned sessions
+            let mut orphaned = session::find_orphaned_sessions();
+            if orphaned.is_empty() {
+                return None;
+            }
+
+            // Take the first session for ourselves
+            let first = orphaned.remove(0);
+            if first.windows.is_empty() {
+                session::cleanup_session(first.session_id);
+                // Still spawn processes for remaining orphans
+            }
+
+            // Spawn new cosmic-term processes for remaining orphaned sessions
+            for remaining in &orphaned {
+                if remaining.windows.is_empty() {
+                    session::cleanup_session(remaining.session_id);
+                    continue;
+                }
+                log::info!(
+                    "spawning new process to restore session {}",
+                    remaining.session_id
+                );
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe)
+                        .env(
+                            "COSMIC_TERM_RESTORE_SESSION",
+                            remaining.session_id.to_string(),
+                        )
+                        .spawn();
+                }
+            }
+
+            if first.windows.is_empty() {
+                return None;
+            }
+            first
+        };
 
         log::info!("restoring session {}", sess.session_id);
 
@@ -1934,48 +1990,30 @@ impl App {
             })
             .copied()?;
 
-        let mut tasks = Vec::new();
-
-        for (win_idx, win_session) in sess.windows.iter().enumerate() {
-            if win_idx == 0 {
-                // Restore into main window
-                self.restore_pane_layout(
-                    &win_session.pane_layout,
-                    &term_event_tx,
-                    colors,
-                    sess.session_id,
-                    true,
-                );
-            } else {
-                // Create extra window and restore into it
-                let (new_id, spawn_task) = window::open(window::Settings::default());
-                let mut window_state = WindowState::new();
-                self.restore_pane_layout_into_window(
-                    &win_session.pane_layout,
-                    &term_event_tx,
-                    colors,
-                    sess.session_id,
-                    &mut window_state,
-                );
-                self.extra_windows.insert(new_id, window_state);
-                tasks.push(spawn_task.map(|id| cosmic::Action::App(Message::WindowOpened(id))));
-            }
+        // Restore the first (and typically only) window into our main window
+        if let Some(win_session) = sess.windows.first() {
+            self.restore_pane_layout(
+                &win_session.pane_layout,
+                &term_event_tx,
+                colors,
+                sess.session_id,
+                true,
+            );
         }
 
         // Clean up session metadata immediately, but defer backup file
-        // deletion so the cat-then-exec shells have time to read them.
+        // deletion so the cat-then-exec shell has time to read scrollback.
         session::cleanup_session_meta(sess.session_id);
         let old_id = sess.session_id;
-        tasks.push(Task::perform(
+        let task = Task::perform(
             async move {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                old_id
+                vec![old_id]
             },
-            |id| cosmic::Action::App(Message::CleanupBackups(id)),
-        ));
+            |ids| cosmic::Action::App(Message::CleanupBackups(ids)),
+        );
 
-        tasks.push(self.update_title(None));
-        Some(Task::batch(tasks))
+        Some(Task::batch(vec![task, self.update_title(None)]))
     }
 
     /// Restore a pane layout into the main window's pane_model.
@@ -2040,72 +2078,6 @@ impl App {
                 }
                 Err(err) => {
                     log::error!("failed to restore terminal: {}", err);
-                    tab_model.remove(entity);
-                }
-            }
-        }
-    }
-
-    /// Restore a pane layout into a WindowState for an extra window.
-    fn restore_pane_layout_into_window(
-        &mut self,
-        layout: &session::PaneLayoutNode,
-        term_event_tx: &mpsc::UnboundedSender<(TerminalId, TermEvent)>,
-        colors: TermColors,
-        old_session_id: u64,
-        window_state: &mut WindowState,
-    ) {
-        let tabs = Self::collect_tabs_from_layout(layout);
-        if tabs.is_empty() {
-            return;
-        }
-
-        // Pre-build options
-        let prepared: Vec<_> = tabs.iter().map(|tab_sess| {
-            let profile_id_opt = tab_sess.profile_id.map(ProfileId);
-            let options = self.build_tty_options_for_restore(tab_sess, old_session_id, profile_id_opt);
-            let tab_title = if let Some(ref ovr) = tab_sess.tab_title_override {
-                ovr.clone()
-            } else if !tab_sess.tab_title.is_empty() {
-                tab_sess.tab_title.clone()
-            } else {
-                fl!("new-terminal")
-            };
-            (profile_id_opt, options, tab_title, tab_sess.tab_title_override.clone(), tab_sess.pinned)
-        }).collect();
-
-        let tab_model = match window_state.pane_model.active_mut() {
-            Some(tm) => tm,
-            None => return,
-        };
-
-        for (profile_id_opt, options, tab_title, title_override, pinned) in prepared {
-            let terminal_id = TerminalId::new();
-            let entity = tab_model
-                .insert()
-                .text(tab_title)
-                .closable()
-                .activate()
-                .id();
-            tab_model.data_set::<TerminalId>(entity, terminal_id);
-
-            match Terminal::new(
-                terminal_id,
-                term_event_tx.clone(),
-                self.term_config.clone(),
-                options,
-                &self.config,
-                colors,
-                profile_id_opt,
-                title_override,
-            ) {
-                Ok(mut terminal) => {
-                    terminal.set_config(&self.config, &self.themes);
-                    terminal.pinned = pinned;
-                    self.terminals.insert(terminal_id, Mutex::new(terminal));
-                }
-                Err(err) => {
-                    log::error!("failed to restore terminal in extra window: {}", err);
                     tab_model.remove(entity);
                 }
             }
@@ -3458,8 +3430,10 @@ impl Application for App {
             Message::SessionSave => {
                 self.save_session();
             }
-            Message::CleanupBackups(old_session_id) => {
-                session::cleanup_backups(old_session_id);
+            Message::CleanupBackups(session_ids) => {
+                for id in session_ids {
+                    session::cleanup_backups(id);
+                }
             }
             Message::TitleEditStart => {
                 self.title_editing_value = String::new();
