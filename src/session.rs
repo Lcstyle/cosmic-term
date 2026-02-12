@@ -91,9 +91,46 @@ impl PaneLayoutNode {
             }
         }
     }
+
+    /// Recursively collect all TabSessions from the tree.
+    pub fn collect_tabs(&self) -> Vec<&TabSession> {
+        match self {
+            PaneLayoutNode::Pane(pane) => pane.tabs.iter().collect(),
+            PaneLayoutNode::Split { a, b, .. } => {
+                let mut tabs = a.collect_tabs();
+                tabs.extend(b.collect_tabs());
+                tabs
+            }
+        }
+    }
 }
 
 impl SessionState {
+    /// Count total tabs across all windows.
+    pub fn tab_count(&self) -> usize {
+        self.windows.iter()
+            .map(|w| w.pane_layout.collect_tabs().len())
+            .sum()
+    }
+
+    /// Check if any tab in the session is pinned.
+    pub fn has_pinned(&self) -> bool {
+        self.windows.iter()
+            .any(|w| w.pane_layout.collect_tabs().iter().any(|t| t.pinned))
+    }
+
+    /// Check if ALL tabs are pinned (no ephemeral tabs).
+    pub fn all_pinned(&self) -> bool {
+        self.all_tabs().iter().all(|t| t.pinned)
+    }
+
+    /// Collect all tabs across all windows (flattened).
+    pub fn all_tabs(&self) -> Vec<&TabSession> {
+        self.windows.iter()
+            .flat_map(|w| w.pane_layout.collect_tabs())
+            .collect()
+    }
+
     /// Return a copy containing only pinned tabs. Returns None if no pinned
     /// tabs exist in any window.
     pub fn pinned_only(&self) -> Option<Self> {

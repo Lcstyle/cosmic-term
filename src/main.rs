@@ -255,6 +255,7 @@ pub enum Action {
     ProfileOpen(ProfileId),
     Profiles,
     SelectAll,
+    Sessions,
     Settings,
     #[cfg(feature = "password_manager")]
     PasswordManager,
@@ -314,6 +315,7 @@ impl Action {
             Self::ProfileOpen(profile_id) => Message::ProfileOpen(*profile_id),
             Self::Profiles => Message::ToggleContextPage(ContextPage::Profiles),
             Self::SelectAll => Message::SelectAll(entity_opt),
+            Self::Sessions => Message::ToggleContextPage(ContextPage::Sessions),
             Self::Settings => Message::ToggleContextPage(ContextPage::Settings),
             Self::ShowHeaderBar(show_headerbar) => Message::ShowHeaderBar(*show_headerbar),
             Self::TabActivate0 => Message::TabActivateJump(0),
@@ -473,6 +475,12 @@ pub enum Message {
     SessionSave,
     SessionClear,
     SessionClearAll,
+    SessionManagerExpand(u64),
+    SessionManagerCollapse(u64),
+    SessionManagerRestore(u64),
+    SessionManagerDelete(u64),
+    SessionManagerDeleteAll,
+    SessionManagerRefresh,
     CleanupBackups(Vec<u64>),
     WindowClose,
     WindowFocusGained(window::Id),
@@ -492,6 +500,7 @@ pub enum ContextPage {
     ColorSchemes(ColorSchemeKind),
     KeyboardShortcuts,
     Profiles,
+    Sessions,
     Settings,
     #[cfg(feature = "password_manager")]
     PasswordManager,
@@ -564,6 +573,8 @@ pub struct App {
     title_ai_suggestion: Option<String>,
     session_id: u64,
     graceful_exit: bool,
+    saved_sessions: Vec<session::SessionState>,
+    session_expanded: Option<u64>,
     #[cfg(feature = "password_manager")]
     password_mgr: password_manager::PasswordManager,
 }
@@ -1834,6 +1845,166 @@ impl App {
         widget::settings::view_column(sections).into()
     }
 
+    fn sessions(&self) -> Element<'_, Message> {
+        let cosmic_theme::Spacing {
+            space_s,
+            space_xxs,
+            ..
+        } = self.core().system_theme().cosmic().spacing;
+
+        let mut sections: Vec<Element<'_, Message>> = Vec::new();
+
+        if self.saved_sessions.is_empty() {
+            sections.push(
+                widget::text::body(fl!("no-saved-sessions")).into()
+            );
+        } else {
+            // Pinned sessions section
+            let pinned: Vec<_> = self.saved_sessions.iter()
+                .filter(|s| s.has_pinned())
+                .collect();
+            if !pinned.is_empty() {
+                let mut section = widget::settings::section()
+                    .title(fl!("pinned-sessions"));
+                for session in &pinned {
+                    section = self.session_item(section, session, space_s, space_xxs);
+                }
+                sections.push(section.into());
+            }
+
+            // Ephemeral sessions section
+            let ephemeral: Vec<_> = self.saved_sessions.iter()
+                .filter(|s| !s.has_pinned())
+                .collect();
+            if !ephemeral.is_empty() {
+                let mut section = widget::settings::section()
+                    .title(fl!("ephemeral-sessions"));
+                for session in &ephemeral {
+                    section = self.session_item(section, session, space_s, space_xxs);
+                }
+                sections.push(section.into());
+            }
+        }
+
+        // Bottom action buttons
+        let buttons = widget::row::with_children(vec![
+            widget::horizontal_space().into(),
+            widget::button::standard(fl!("refresh-sessions"))
+                .on_press(Message::SessionManagerRefresh)
+                .into(),
+            widget::button::destructive(fl!("delete-all-sessions"))
+                .on_press_maybe(
+                    if self.saved_sessions.is_empty() { None }
+                    else { Some(Message::SessionManagerDeleteAll) }
+                )
+                .into(),
+        ]).spacing(space_xxs);
+        sections.push(buttons.into());
+
+        widget::settings::view_column(sections).into()
+    }
+
+    fn session_item<'a>(
+        &'a self,
+        mut section: widget::settings::Section<'a, Message>,
+        session: &session::SessionState,
+        space_s: u16,
+        space_xxs: u16,
+    ) -> widget::settings::Section<'a, Message> {
+        let sid = session.session_id;
+        let tab_count = session.tab_count();
+        let win_count = session.windows.len();
+        let expanded = self.session_expanded == Some(sid);
+        let is_pinned = session.has_pinned();
+
+        // Pinned sessions: show first pinned tab name as label
+        // Ephemeral sessions: show "N windows, M tabs" summary
+        let label = if is_pinned {
+            let pinned_tabs: Vec<_> = session.all_tabs().into_iter()
+                .filter(|t| t.pinned)
+                .collect();
+            let first_name = pinned_tabs.first()
+                .map(|t| t.tab_title_override.as_deref()
+                    .unwrap_or(&t.tab_title))
+                .unwrap_or("?");
+            if pinned_tabs.len() > 1 {
+                format!("{} (+{} more)", first_name, pinned_tabs.len() - 1)
+            } else {
+                first_name.to_string()
+            }
+        } else {
+            fl!(
+                "session-summary",
+                windows = win_count.to_string(),
+                tabs = tab_count.to_string()
+            )
+        };
+
+        let controls = widget::row::with_children(vec![
+            widget::button::custom(icon_cache_get("media-playback-start-symbolic", 16))
+                .on_press(Message::SessionManagerRestore(sid))
+                .class(style::Button::Icon)
+                .into(),
+            widget::button::custom(icon_cache_get("edit-delete-symbolic", 16))
+                .on_press(Message::SessionManagerDelete(sid))
+                .class(style::Button::Icon)
+                .into(),
+            if expanded {
+                widget::button::custom(icon_cache_get("go-up-symbolic", 16))
+                    .on_press(Message::SessionManagerCollapse(sid))
+            } else {
+                widget::button::custom(icon_cache_get("go-down-symbolic", 16))
+                    .on_press(Message::SessionManagerExpand(sid))
+            }
+            .class(style::Button::Icon)
+            .into(),
+        ])
+        .align_y(Alignment::Center)
+        .spacing(space_xxs);
+
+        section = section.add(
+            widget::settings::item::builder(label).control(controls)
+        );
+
+        if expanded {
+            // For pinned sessions, show the summary line first in the dropdown
+            if is_pinned {
+                let summary = fl!(
+                    "session-summary",
+                    windows = win_count.to_string(),
+                    tabs = tab_count.to_string()
+                );
+                section = section.add(
+                    widget::container(
+                        widget::text::caption(summary)
+                    ).padding([0, 0, 0, space_s])
+                );
+            }
+
+            for tab in session.all_tabs() {
+                let title = tab.tab_title_override.as_deref()
+                    .unwrap_or(&tab.tab_title);
+                let desc = tab.working_directory.as_deref().unwrap_or("");
+                let pin_label = if tab.pinned {
+                    format!("{title} [pinned]")
+                } else {
+                    title.to_string()
+                };
+
+                section = section.add(
+                    widget::container(
+                        widget::column::with_children(vec![
+                            widget::text::body(pin_label).into(),
+                            widget::text::caption(desc.to_string()).into(),
+                        ]).spacing(2)
+                    ).padding([0, 0, 0, space_s])
+                );
+            }
+        }
+
+        section
+    }
+
     fn settings(&self) -> Element<'_, Message> {
         let app_theme_selected = match self.config.app_theme {
             AppTheme::Dark => 1,
@@ -2855,6 +3026,8 @@ impl Application for App {
             title_ai_suggestion: None,
             session_id: session::generate_session_id(),
             graceful_exit: false,
+            saved_sessions: Vec::new(),
+            session_expanded: None,
             #[cfg(feature = "password_manager")]
             password_mgr: Default::default(),
         };
@@ -3873,6 +4046,48 @@ impl Application for App {
                 log::info!("clearing all session backups");
                 session::cleanup_all_sessions();
             }
+            Message::SessionManagerExpand(sid) => {
+                self.session_expanded = Some(sid);
+            }
+            Message::SessionManagerCollapse(_sid) => {
+                self.session_expanded = None;
+            }
+            Message::SessionManagerRefresh => {
+                self.saved_sessions = session::find_orphaned_sessions();
+                self.session_expanded = None;
+            }
+            Message::SessionManagerDelete(sid) => {
+                session::cleanup_session(sid);
+                self.saved_sessions.retain(|s| s.session_id != sid);
+                if self.session_expanded == Some(sid) {
+                    self.session_expanded = None;
+                }
+            }
+            Message::SessionManagerDeleteAll => {
+                for s in &self.saved_sessions {
+                    session::cleanup_session(s.session_id);
+                }
+                self.saved_sessions.clear();
+                self.session_expanded = None;
+            }
+            Message::SessionManagerRestore(sid) => {
+                if let Ok(exe) = std::env::current_exe() {
+                    #[cfg(unix)]
+                    unsafe {
+                        let _ = std::process::Command::new(exe)
+                            .env("COSMIC_TERM_RESTORE_SESSION", sid.to_string())
+                            .pre_exec(|| {
+                                libc::setsid();
+                                Ok(())
+                            })
+                            .spawn();
+                    }
+                }
+                self.saved_sessions.retain(|s| s.session_id != sid);
+                if self.session_expanded == Some(sid) {
+                    self.session_expanded = None;
+                }
+            }
             Message::CleanupBackups(session_ids) => {
                 for id in session_ids {
                     session::cleanup_backups(id);
@@ -4569,6 +4784,11 @@ impl Application for App {
                         });
                 }
 
+                if let ContextPage::Sessions = context_page {
+                    self.saved_sessions = session::find_orphaned_sessions();
+                    self.session_expanded = None;
+                }
+
                 if let ContextPage::KeyboardShortcuts = context_page {
                     self.shortcut_page_toggle();
                     return self.update_focus();
@@ -4743,6 +4963,11 @@ impl Application for App {
                 Message::ToggleContextPage(ContextPage::Profiles),
             )
             .title(fl!("profiles")),
+            ContextPage::Sessions => context_drawer::context_drawer(
+                self.sessions(),
+                Message::ToggleContextPage(ContextPage::Sessions),
+            )
+            .title(fl!("sessions")),
             ContextPage::Settings => context_drawer::context_drawer(
                 self.settings(),
                 Message::ToggleContextPage(ContextPage::Settings),

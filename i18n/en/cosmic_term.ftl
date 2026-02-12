@@ -145,6 +145,22 @@ unpin-terminal = Unpin Terminal
 clear-session = Clear session backup
 clear-all-sessions = Clear all session backups
 
+# Session Manager
+sessions = Sessions
+menu-sessions = Saved Sessions...
+no-saved-sessions = No saved sessions found
+pinned-sessions = Pinned
+ephemeral-sessions = Ephemeral
+session-summary = {$windows} {$windows ->
+    [one] window
+   *[other] windows
+}, {$tabs} {$tabs ->
+    [one] tab
+   *[other] tabs
+}
+refresh-sessions = Refresh
+delete-all-sessions = Delete All
+
 # Password Manager
 menu-password-manager = Passwords...
 passwords-title = Passwords
