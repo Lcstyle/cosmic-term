@@ -3,6 +3,8 @@
 
 use alacritty_terminal::tty::Options;
 use alacritty_terminal::{event::Event as TermEvent, term, term::color::Colors as TermColors, tty};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use cosmic::iced::clipboard::dnd::DndAction;
 use cosmic::iced_core::keyboard::key::Named;
 use cosmic::widget::menu::action::MenuAction;
@@ -2223,12 +2225,21 @@ impl App {
                     remaining.session_id
                 );
                 if let Ok(exe) = std::env::current_exe() {
-                    let _ = std::process::Command::new(exe)
-                        .env(
-                            "COSMIC_TERM_RESTORE_SESSION",
-                            remaining.session_id.to_string(),
-                        )
-                        .spawn();
+                    // Use pre_exec setsid to detach child from parent.
+                    // Without this, the child becomes a zombie when it exits
+                    // because the parent never calls wait().
+                    unsafe {
+                        let _ = std::process::Command::new(exe)
+                            .env(
+                                "COSMIC_TERM_RESTORE_SESSION",
+                                remaining.session_id.to_string(),
+                            )
+                            .pre_exec(|| {
+                                libc::setsid();
+                                Ok(())
+                            })
+                            .spawn();
+                    }
                 }
             }
 

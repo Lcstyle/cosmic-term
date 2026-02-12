@@ -182,7 +182,7 @@ pub fn remove_lock(session_id: u64) -> Option<()> {
     Some(())
 }
 
-/// Check if the lock file's PID is still alive.
+/// Check if the lock file's PID is still alive (and not a zombie).
 pub fn is_lock_active(session_id: u64) -> bool {
     let Some(dir) = session_dir() else {
         return false;
@@ -194,8 +194,26 @@ pub fn is_lock_active(session_id: u64) -> bool {
     let Ok(pid) = contents.trim().parse::<i32>() else {
         return false;
     };
+    is_pid_alive(pid)
+}
+
+/// Check if a PID is alive and not a zombie process.
+fn is_pid_alive(pid: i32) -> bool {
     // kill(pid, 0) checks if process exists without sending a signal
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) != 0 } {
+        return false;
+    }
+    // Zombie processes pass kill(pid, 0) but can't clean up their session
+    // files. Check /proc/<pid>/status to detect them.
+    let status_path = format!("/proc/{pid}/status");
+    if let Ok(status) = fs::read_to_string(&status_path) {
+        for line in status.lines() {
+            if let Some(state) = line.strip_prefix("State:") {
+                return !state.trim_start().starts_with('Z');
+            }
+        }
+    }
+    false
 }
 
 /// Check if any other cosmic-term process has an active session lock.
@@ -213,7 +231,7 @@ pub fn any_other_instance_running() -> bool {
         if path.extension().is_some_and(|e| e == "lock") {
             if let Ok(contents) = fs::read_to_string(&path) {
                 if let Ok(pid) = contents.trim().parse::<i32>() {
-                    if pid != my_pid && unsafe { libc::kill(pid, 0) == 0 } {
+                    if pid != my_pid && is_pid_alive(pid) {
                         return true;
                     }
                 }
