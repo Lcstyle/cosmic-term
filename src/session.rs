@@ -404,3 +404,49 @@ pub fn save_scrollback(session_id: u64, tab_idx: usize, content: &str) -> Option
 pub fn scrollback_path(filename: &str) -> Option<PathBuf> {
     backup_dir().map(|d| d.join(filename))
 }
+
+/// Decode the session start time from session_id and pid.
+/// Reverses the XOR encoding from generate_session_id().
+pub fn decode_start_time(session_id: u64, pid: u32) -> Option<SystemTime> {
+    let ts_ms = session_id ^ ((pid as u64) << 32);
+    // Sanity check: timestamp should be reasonable (after 2020, before 2100)
+    if ts_ms > 1_577_836_800_000 && ts_ms < 4_102_444_800_000 {
+        Some(UNIX_EPOCH + std::time::Duration::from_millis(ts_ms))
+    } else {
+        None
+    }
+}
+
+/// Get session end time from the JSON file's modification time.
+pub fn get_end_time(session_id: u64) -> Option<SystemTime> {
+    let dir = session_dir()?;
+    let path = dir.join(format!("{session_id}.json"));
+    fs::metadata(&path).ok()?.modified().ok()
+}
+
+/// Scan scrollback text for the last `claude --resume <id>` command.
+pub fn find_claude_resume_id(scrollback_text: &str) -> Option<&str> {
+    for line in scrollback_text.lines().rev() {
+        if let Some(pos) = line.find("claude --resume ") {
+            let after = &line[pos + "claude --resume ".len()..];
+            let token: &str = after.split_whitespace().next()?;
+            if token.len() >= 8 && token.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
+/// Format a unix timestamp as local time "YYYY-MM-DD HH:MM:SS".
+pub fn format_timestamp(unix_secs: u64) -> String {
+    let time_t = unix_secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&time_t, &mut tm) };
+    let mut buf = [0u8; 64];
+    let fmt = std::ffi::CString::new("%Y-%m-%d %H:%M:%S").unwrap();
+    let len = unsafe {
+        libc::strftime(buf.as_mut_ptr() as *mut libc::c_char, buf.len(), fmt.as_ptr(), &tm)
+    };
+    String::from_utf8_lossy(&buf[..len]).to_string()
+}

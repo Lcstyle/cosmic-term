@@ -2446,6 +2446,7 @@ impl App {
             let prepared = self.prepare_tab_restore(
                 &win_session.pane_layout,
                 sess.session_id,
+                sess.pid,
             );
             if prepared.is_empty() {
                 continue;
@@ -2514,11 +2515,12 @@ impl App {
         &self,
         layout: &session::PaneLayoutNode,
         old_session_id: u64,
+        old_pid: u32,
     ) -> Vec<(Option<ProfileId>, Options, String, Option<String>, bool)> {
         let tabs = Self::collect_tabs_from_layout(layout);
         tabs.iter().map(|tab_sess| {
             let profile_id_opt = tab_sess.profile_id.map(ProfileId);
-            let options = self.build_tty_options_for_restore(tab_sess, old_session_id, profile_id_opt);
+            let options = self.build_tty_options_for_restore(tab_sess, old_session_id, old_pid, profile_id_opt);
             let tab_title = if let Some(ref ovr) = tab_sess.tab_title_override {
                 ovr.clone()
             } else if !tab_sess.tab_title.is_empty() {
@@ -2591,7 +2593,8 @@ impl App {
     fn build_tty_options_for_restore(
         &self,
         tab_sess: &session::TabSession,
-        _old_session_id: u64,
+        old_session_id: u64,
+        old_pid: u32,
         profile_id_opt: Option<ProfileId>,
     ) -> Options {
         let profile_opt = profile_id_opt.and_then(|pid| self.config.profiles.get(&pid));
@@ -2623,14 +2626,50 @@ impl App {
                 std::env::var("SHELL").unwrap_or_else(|_| "bash".to_string())
             });
 
-        // Build shell with optional scrollback injection
+        // Build shell with optional scrollback injection + restore banner
         let shell = if let Some(ref scrollback_file) = tab_sess.scrollback_file {
             if let Some(path) = session::scrollback_path(scrollback_file) {
                 if path.exists() {
                     let escaped = shlex::try_quote(&path.to_string_lossy())
                         .unwrap_or(std::borrow::Cow::Borrowed(""))
                         .into_owned();
-                    let cmd = format!("cat {} 2>/dev/null; exec {}", escaped, original_shell);
+
+                    // Read scrollback to scan for claude --resume
+                    let scrollback_text = std::fs::read_to_string(&path).unwrap_or_default();
+                    let claude_resume = session::find_claude_resume_id(&scrollback_text);
+
+                    // Build banner lines
+                    let separator = "\u{2500}".repeat(60); // ─
+                    let mut banner_lines = Vec::new();
+                    banner_lines.push(separator.clone());
+                    banner_lines.push("  Session Restored".to_string());
+
+                    if let Some(start) = session::decode_start_time(old_session_id, old_pid) {
+                        if let Ok(dur) = start.duration_since(std::time::UNIX_EPOCH) {
+                            banner_lines.push(format!(
+                                "  Started: {}",
+                                session::format_timestamp(dur.as_secs())
+                            ));
+                        }
+                    }
+                    if let Some(end) = session::get_end_time(old_session_id) {
+                        if let Ok(dur) = end.duration_since(std::time::UNIX_EPOCH) {
+                            banner_lines.push(format!(
+                                "  Ended:   {}",
+                                session::format_timestamp(dur.as_secs())
+                            ));
+                        }
+                    }
+                    if let Some(resume_id) = claude_resume {
+                        banner_lines.push(format!("  Claude:  claude --resume {}", resume_id));
+                    }
+                    banner_lines.push(separator);
+
+                    let banner = banner_lines.join("\\n");
+                    let cmd = format!(
+                        "cat {} 2>/dev/null; printf '\\n{}\\n'; exec {}",
+                        escaped, banner, original_shell
+                    );
                     Some(tty::Shell::new("sh".into(), vec!["-c".into(), cmd]))
                 } else {
                     None
