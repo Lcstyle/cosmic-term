@@ -4,8 +4,9 @@
 use alacritty_terminal::tty::Options;
 use alacritty_terminal::{event::Event as TermEvent, term, term::color::Colors as TermColors, tty};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use cosmic::iced::clipboard::dnd::DndAction;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use cosmic::iced_core::keyboard::key::Named;
 use cosmic::widget::menu::action::MenuAction;
 use cosmic::widget::menu::key_bind::KeyBind;
@@ -511,6 +512,29 @@ struct ShortcutConflict {
     binding: shortcuts::Binding,
     existing_action: shortcuts::KeyBindAction,
     new_action: shortcuts::KeyBindAction,
+}
+
+/// Pre-built tab data for restore, decoupled from &self borrow.
+struct PreparedTab {
+    profile_id: Option<ProfileId>,
+    options: Options,
+    tab_title: String,
+    title_override: Option<String>,
+    pinned: bool,
+}
+
+/// Pre-built pane layout tree for restore, preserving split structure.
+enum PreparedLayout {
+    Pane {
+        tabs: Vec<PreparedTab>,
+        active_tab: usize,
+    },
+    Split {
+        axis: pane_grid::Axis,
+        ratio: f32,
+        a: Box<PreparedLayout>,
+        b: Box<PreparedLayout>,
+    },
 }
 
 /// The [`App`] stores application-specific state.
@@ -2307,23 +2331,16 @@ impl App {
         session::write_lock(self.session_id);
     }
 
-    /// Try to restore an orphaned session. Returns Some(Task) if restored.
+    /// Try to restore orphaned sessions. Returns Some(Task) if restored.
     ///
-    /// Each orphaned session (= one previous process) is restored into its own
-    /// process. This process claims one session: main window populates our main
-    /// window, extra windows (from tab-detach) become iced sub-windows so tab
-    /// reattach works. Remaining orphaned sessions are spawned as separate
-    /// cosmic-term processes, each restoring their own windows the same way.
+    /// This process claims one session and restores it (with proper split
+    /// layouts and sub-windows). Remaining orphaned sessions each get their
+    /// own process so closing one window doesn't affect the others.
     fn try_restore_session(&mut self) -> Option<Task<Message>> {
-        // Only restore if this is the first cosmic-term instance.
-        // If other instances are already running, this is just a new window request.
-        // Exception: if we were explicitly spawned to restore a specific session
-        // (from another instance's restore flow).
+        // If spawned to restore a specific session, handle that directly.
         let targeted_id = std::env::var("COSMIC_TERM_RESTORE_SESSION")
             .ok()
             .and_then(|s| s.parse::<u64>().ok());
-
-        // Clear the env var so child shells don't inherit it
         // SAFETY: no other threads are reading this env var at this point in startup
         unsafe { std::env::remove_var("COSMIC_TERM_RESTORE_SESSION") };
 
@@ -2332,61 +2349,51 @@ impl App {
             return None;
         }
 
-        let sess = if let Some(target_id) = targeted_id {
-            // We were spawned to restore a specific session
+        let (sess, remaining) = if let Some(target_id) = targeted_id {
             let s = session::read_session(target_id)?;
             if s.windows.is_empty() {
                 session::cleanup_session(s.session_id);
                 return None;
             }
-            s
+            (s, Vec::new())
         } else {
-            // Find all orphaned sessions
             let mut orphaned = session::find_orphaned_sessions();
             if orphaned.is_empty() {
                 return None;
             }
-
-            // Claim the first session for this process
             let first = orphaned.remove(0);
-
-            // Spawn a new process for each remaining orphaned session
-            for remaining in &orphaned {
-                if remaining.windows.is_empty() {
-                    session::cleanup_session(remaining.session_id);
-                    continue;
-                }
-                log::info!(
-                    "spawning new process to restore session {}",
-                    remaining.session_id
-                );
-                if let Ok(exe) = std::env::current_exe() {
-                    // Use pre_exec setsid to detach child from parent.
-                    // Without this, the child becomes a zombie when it exits
-                    // because the parent never calls wait().
-                    unsafe {
-                        let _ = std::process::Command::new(exe)
-                            .env(
-                                "COSMIC_TERM_RESTORE_SESSION",
-                                remaining.session_id.to_string(),
-                            )
-                            .pre_exec(|| {
-                                libc::setsid();
-                                Ok(())
-                            })
-                            .spawn();
-                    }
-                }
-            }
-
             if first.windows.is_empty() {
                 session::cleanup_session(first.session_id);
                 return None;
             }
-            first
+            (first, orphaned)
         };
 
-        log::info!("restoring session {}", sess.session_id);
+        // Spawn a separate process for each remaining orphaned session.
+        // Use a thread to wait() on each child so they don't become zombies.
+        for extra in &remaining {
+            if extra.windows.is_empty() {
+                session::cleanup_session(extra.session_id);
+                continue;
+            }
+            log::info!("spawning process for session {}", extra.session_id);
+            if let Ok(exe) = std::env::current_exe() {
+                #[cfg(unix)]
+                {
+                    let result = unsafe {
+                        std::process::Command::new(exe)
+                            .env("COSMIC_TERM_RESTORE_SESSION", extra.session_id.to_string())
+                            .pre_exec(|| { libc::setsid(); Ok(()) })
+                            .spawn()
+                    };
+                    if let Ok(mut child) = result {
+                        std::thread::spawn(move || { let _ = child.wait(); });
+                    }
+                }
+            }
+        }
+
+        log::info!("restoring session {} ({} windows)", sess.session_id, sess.windows.len());
 
         let term_event_tx = self.term_event_tx_opt.as_ref()?.clone();
         let colors = self
@@ -2403,63 +2410,63 @@ impl App {
             })
             .copied()?;
 
+        // Phase 1: prepare layout data (borrows &self for config)
+        let prepared_windows: Vec<(bool, PreparedLayout)> = sess.windows.iter()
+            .map(|w| {
+                let prepared = self.prepare_layout_restore(
+                    &w.pane_layout, sess.session_id, sess.pid,
+                );
+                (w.is_main, prepared)
+            })
+            .collect();
+
+        // Phase 2: apply layouts (borrows &mut pane_model, &mut terminals)
         let mut tasks = Vec::new();
         let mut main_restored = false;
 
-        for win_session in &sess.windows {
-            // Pre-build options while borrowing &self (no pane_model conflict)
-            let prepared = self.prepare_tab_restore(
-                &win_session.pane_layout,
-                sess.session_id,
-                sess.pid,
-            );
-            if prepared.is_empty() {
-                continue;
-            }
-
-            if win_session.is_main && !main_restored {
-                // Restore into our main window's active pane.
-                // Split borrows: pane_model vs terminals vs config fields.
-                if let Some(tab_model) = self.pane_model.active_mut() {
-                    Self::populate_restored_tabs(
-                        tab_model,
-                        &mut self.terminals,
-                        prepared,
-                        &term_event_tx,
-                        &self.term_config,
-                        &self.config,
-                        colors,
-                        &self.themes,
-                    );
-                }
+        for (is_main, prepared) in prepared_windows {
+            if is_main && !main_restored {
+                let initial_pane = self.pane_model.focused();
+                Self::apply_layout(
+                    &mut self.pane_model.panes,
+                    initial_pane,
+                    prepared,
+                    &mut self.terminals,
+                    &mut self.terminal_ids,
+                    &mut self.pane_model.panes_created,
+                    &term_event_tx,
+                    &self.term_config,
+                    &self.config,
+                    colors,
+                    &self.themes,
+                );
                 main_restored = true;
             } else {
-                // Restore as an iced sub-window (same invariant as tab-detach)
                 let (new_window_id, spawn_task) =
                     window::open(window::Settings::default());
-
                 let mut new_state = WindowState::new();
-                if let Some(tab_model) = new_state.pane_model.active_mut() {
-                    Self::populate_restored_tabs(
-                        tab_model,
-                        &mut self.terminals,
-                        prepared,
-                        &term_event_tx,
-                        &self.term_config,
-                        &self.config,
-                        colors,
-                        &self.themes,
-                    );
-                }
+                let initial_pane = new_state.pane_model.focused();
+                Self::apply_layout(
+                    &mut new_state.pane_model.panes,
+                    initial_pane,
+                    prepared,
+                    &mut self.terminals,
+                    &mut new_state.terminal_ids,
+                    &mut new_state.pane_model.panes_created,
+                    &term_event_tx,
+                    &self.term_config,
+                    &self.config,
+                    colors,
+                    &self.themes,
+                );
                 self.extra_windows.insert(new_window_id, new_state);
                 tasks.push(
-                    spawn_task
-                        .map(|_id| cosmic::Action::App(Message::WindowFocused)),
+                    spawn_task.map(|_id| cosmic::Action::App(Message::WindowFocused)),
                 );
             }
         }
 
-        // Clean up session metadata immediately, defer backup file deletion
+        // Clean up old session metadata, defer backup file deletion
         session::cleanup_session_meta(sess.session_id);
         let old_id = sess.session_id;
         let cleanup_task = Task::perform(
@@ -2475,63 +2482,137 @@ impl App {
         Some(Task::batch(tasks))
     }
 
-    /// Pre-build restore options from a pane layout (borrows &self for config).
-    fn prepare_tab_restore(
+    /// Pre-build restore data from a pane layout tree, preserving split structure.
+    /// Borrows &self for config/profile access. The returned PreparedLayout is
+    /// then applied via apply_layout() which borrows pane_model mutably.
+    fn prepare_layout_restore(
         &self,
         layout: &session::PaneLayoutNode,
         old_session_id: u64,
         old_pid: u32,
-    ) -> Vec<(Option<ProfileId>, Options, String, Option<String>, bool)> {
-        let tabs = Self::collect_tabs_from_layout(layout);
-        tabs.iter().map(|tab_sess| {
-            let profile_id_opt = tab_sess.profile_id.map(ProfileId);
-            let options = self.build_tty_options_for_restore(tab_sess, old_session_id, old_pid, profile_id_opt);
-            let tab_title = if let Some(ref ovr) = tab_sess.tab_title_override {
-                ovr.clone()
-            } else if !tab_sess.tab_title.is_empty() {
-                tab_sess.tab_title.clone()
-            } else {
-                fl!("new-terminal")
-            };
-            (profile_id_opt, options, tab_title, tab_sess.tab_title_override.clone(), tab_sess.pinned)
-        }).collect()
+    ) -> PreparedLayout {
+        match layout {
+            session::PaneLayoutNode::Pane(pane_sess) => {
+                let tabs = pane_sess.tabs.iter().map(|tab_sess| {
+                    let profile_id_opt = tab_sess.profile_id.map(ProfileId);
+                    let options = self.build_tty_options_for_restore(
+                        tab_sess, old_session_id, old_pid, profile_id_opt,
+                    );
+                    let tab_title = tab_sess.tab_title_override.as_deref()
+                        .filter(|s| !s.is_empty())
+                        .or(Some(tab_sess.tab_title.as_str()).filter(|s| !s.is_empty()))
+                        .map(String::from)
+                        .unwrap_or_else(|| fl!("new-terminal"));
+                    PreparedTab {
+                        profile_id: profile_id_opt,
+                        options,
+                        tab_title,
+                        title_override: tab_sess.tab_title_override.clone(),
+                        pinned: tab_sess.pinned,
+                    }
+                }).collect();
+                PreparedLayout::Pane { tabs, active_tab: pane_sess.active_tab }
+            }
+            session::PaneLayoutNode::Split { axis, ratio, a, b } => {
+                let iced_axis = match axis {
+                    session::SplitAxis::Horizontal => pane_grid::Axis::Horizontal,
+                    session::SplitAxis::Vertical => pane_grid::Axis::Vertical,
+                };
+                PreparedLayout::Split {
+                    axis: iced_axis,
+                    ratio: *ratio,
+                    a: Box::new(self.prepare_layout_restore(a, old_session_id, old_pid)),
+                    b: Box::new(self.prepare_layout_restore(b, old_session_id, old_pid)),
+                }
+            }
+        }
     }
 
-    /// Populate a tab model with prepared restore data. Static method to allow
-    /// split borrows on App fields (pane_model vs terminals vs config).
-    fn populate_restored_tabs(
-        tab_model: &mut TabModel,
+    /// Recursively apply a PreparedLayout to a pane_grid, recreating splits and
+    /// populating tabs. Static method for split-borrow safety.
+    fn apply_layout(
+        pane_state: &mut pane_grid::State<TabModel>,
+        pane: pane_grid::Pane,
+        prepared: PreparedLayout,
         terminals: &mut HashMap<TerminalId, Mutex<Terminal>>,
-        prepared: Vec<(Option<ProfileId>, Options, String, Option<String>, bool)>,
+        terminal_ids: &mut HashMap<pane_grid::Pane, widget::Id>,
+        panes_created: &mut usize,
         term_event_tx: &mpsc::UnboundedSender<(TerminalId, TermEvent)>,
         term_config: &term::Config,
         config: &Config,
         colors: TermColors,
         themes: &HashMap<(String, ColorSchemeKind), TermColors>,
     ) {
-        for (profile_id_opt, options, tab_title, title_override, pinned) in prepared {
+        match prepared {
+            PreparedLayout::Pane { tabs, active_tab } => {
+                if let Some(tab_model) = pane_state.get_mut(pane) {
+                    Self::populate_pane_tabs(
+                        tab_model, terminals, tabs, active_tab,
+                        term_event_tx, term_config, config, colors, themes,
+                    );
+                }
+            }
+            PreparedLayout::Split { axis, ratio, a, b } => {
+                if let Some((new_pane, split_id)) = pane_state.split(
+                    axis,
+                    pane,
+                    segmented_button::ModelBuilder::default().build(),
+                ) {
+                    pane_state.resize(split_id, ratio);
+                    terminal_ids.insert(new_pane, widget::Id::unique());
+                    *panes_created += 1;
+
+                    // pane keeps "a" side, new_pane gets "b" side
+                    Self::apply_layout(
+                        pane_state, pane, *a, terminals, terminal_ids,
+                        panes_created, term_event_tx, term_config, config, colors, themes,
+                    );
+                    Self::apply_layout(
+                        pane_state, new_pane, *b, terminals, terminal_ids,
+                        panes_created, term_event_tx, term_config, config, colors, themes,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Populate a single pane's tab model with prepared tabs.
+    fn populate_pane_tabs(
+        tab_model: &mut TabModel,
+        terminals: &mut HashMap<TerminalId, Mutex<Terminal>>,
+        tabs: Vec<PreparedTab>,
+        active_tab: usize,
+        term_event_tx: &mpsc::UnboundedSender<(TerminalId, TermEvent)>,
+        term_config: &term::Config,
+        config: &Config,
+        colors: TermColors,
+        themes: &HashMap<(String, ColorSchemeKind), TermColors>,
+    ) {
+        let mut entities = Vec::new();
+        for pt in tabs {
             let terminal_id = TerminalId::new();
             let entity = tab_model
                 .insert()
-                .text(tab_title)
+                .text(pt.tab_title)
                 .closable()
                 .activate()
                 .id();
             tab_model.data_set::<TerminalId>(entity, terminal_id);
+            entities.push(entity);
 
             match Terminal::new(
                 terminal_id,
                 term_event_tx.clone(),
                 term_config.clone(),
-                options,
+                pt.options,
                 config,
                 colors,
-                profile_id_opt,
-                title_override,
+                pt.profile_id,
+                pt.title_override,
             ) {
                 Ok(mut terminal) => {
                     terminal.set_config(config, themes);
-                    terminal.pinned = pinned;
+                    terminal.pinned = pt.pinned;
                     terminals.insert(terminal_id, Mutex::new(terminal));
                 }
                 Err(err) => {
@@ -2540,17 +2621,9 @@ impl App {
                 }
             }
         }
-    }
-
-    /// Flatten all tabs from a pane layout tree.
-    fn collect_tabs_from_layout(layout: &session::PaneLayoutNode) -> Vec<session::TabSession> {
-        match layout {
-            session::PaneLayoutNode::Pane(pane_sess) => pane_sess.tabs.clone(),
-            session::PaneLayoutNode::Split { a, b, .. } => {
-                let mut tabs = Self::collect_tabs_from_layout(a);
-                tabs.extend(Self::collect_tabs_from_layout(b));
-                tabs
-            }
+        // Activate the correct tab
+        if let Some(&entity) = entities.get(active_tab) {
+            tab_model.activate(entity);
         }
     }
 
@@ -4075,16 +4148,19 @@ impl Application for App {
                 self.session_expanded = None;
             }
             Message::SessionManagerRestore(sid) => {
+                // Spawn a separate process so the restored session is independent.
                 if let Ok(exe) = std::env::current_exe() {
                     #[cfg(unix)]
-                    unsafe {
-                        let _ = std::process::Command::new(exe)
-                            .env("COSMIC_TERM_RESTORE_SESSION", sid.to_string())
-                            .pre_exec(|| {
-                                libc::setsid();
-                                Ok(())
-                            })
-                            .spawn();
+                    {
+                        let result = unsafe {
+                            std::process::Command::new(exe)
+                                .env("COSMIC_TERM_RESTORE_SESSION", sid.to_string())
+                                .pre_exec(|| { libc::setsid(); Ok(()) })
+                                .spawn()
+                        };
+                        if let Ok(mut child) = result {
+                            std::thread::spawn(move || { let _ = child.wait(); });
+                        }
                     }
                 }
                 self.saved_sessions.retain(|s| s.session_id != sid);
@@ -4894,13 +4970,17 @@ impl Application for App {
                     }
                 }
 
-                // If this was a graceful close and no windows remain, do a
-                // full save so all tabs (pinned + ephemeral) restore on
-                // next launch. The pinned-only filter is for individual
-                // window closes, not app-wide shutdown.
-                if self.graceful_exit && self.extra_windows.is_empty() {
-                    self.save_session();
-                    session::remove_lock(self.session_id);
+                if self.extra_windows.is_empty() {
+                    if self.graceful_exit {
+                        // File > Quit: save full session for restore on next launch
+                        self.save_session();
+                        session::remove_lock(self.session_id);
+                    } else {
+                        // User closed the last window: clean up session entirely.
+                        // Crash recovery is handled by the periodic save + stale
+                        // lock detection, so we don't need to preserve anything here.
+                        session::cleanup_session(self.session_id);
+                    }
                 }
             }
             Message::WindowFocusGained(window_id) => {
