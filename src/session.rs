@@ -69,6 +69,39 @@ impl PaneLayoutNode {
             }
         }
     }
+
+    /// Return a filtered copy keeping only pinned tabs.
+    /// Returns None if no pinned tabs remain.
+    pub fn pinned_only(&self) -> Option<PaneLayoutNode> {
+        match self {
+            PaneLayoutNode::Pane(pane) => {
+                let pinned_tabs: Vec<_> = pane.tabs.iter()
+                    .filter(|t| t.pinned)
+                    .cloned()
+                    .collect();
+                if pinned_tabs.is_empty() {
+                    None
+                } else {
+                    Some(PaneLayoutNode::Pane(PaneSession {
+                        tabs: pinned_tabs,
+                        active_tab: 0,
+                    }))
+                }
+            }
+            PaneLayoutNode::Split { axis, ratio, a, b } => {
+                match (a.pinned_only(), b.pinned_only()) {
+                    (Some(a), Some(b)) => Some(PaneLayoutNode::Split {
+                        axis: *axis,
+                        ratio: *ratio,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                    }),
+                    (Some(node), None) | (None, Some(node)) => Some(node),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
 }
 
 impl SessionState {

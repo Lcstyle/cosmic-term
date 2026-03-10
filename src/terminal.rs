@@ -72,6 +72,20 @@ fn url_regex_search() -> RegexSearch {
     RegexSearch::new(url_regex).unwrap()
 }
 
+/// Returns true if `c` is a valid URL body character, matching the character
+/// class used in `url_regex_search` (everything except whitespace, C0/C1
+/// controls, and the explicitly excluded punctuation).
+fn is_valid_url_char(c: char) -> bool {
+    if c.is_whitespace() {
+        return false;
+    }
+    let code = c as u32;
+    if code <= 0x1F || (0x7F..=0x9F).contains(&code) {
+        return false;
+    }
+    !matches!(c, '<' | '>' | '"' | '^' | '⟨' | '⟩' | '`' | '{' | '|' | '}')
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Size {
     pub width: u32,
@@ -810,6 +824,51 @@ impl Terminal {
                         .extend(regex_matches.drain(..).flat_map(|rm| -> Vec<_> {
                             HintPostProcessor::new(&term, &mut self.url_regex_search, rm).collect()
                         }));
+                }
+
+                // Extend URL matches across soft-wrapped lines.
+                //
+                // alacritty_terminal's RegexIter stops at a line boundary unless the
+                // WRAPLINE flag is set on the last cell of the line — but that only
+                // helps when the regex already has an active match spanning the wrap.
+                // In practice the URL regex requires a scheme prefix, so the second
+                // visual line of a wrapped URL is never matched independently.
+                //
+                // Fix: after collecting matches, any match that ends at the last
+                // column of a WRAPLINE cell is extended by scanning the next line for
+                // valid URL characters (same class as the regex body, no scheme
+                // prefix required).
+                {
+                    let grid = term.grid();
+                    let cols = grid.columns();
+                    if cols > 0 {
+                        let last_column = Column(cols - 1);
+                        let mut i = 0;
+                        while i < self.regex_matches.len() {
+                            let end = *self.regex_matches[i].end();
+                            if end.column == last_column
+                                && grid[end].flags.contains(Flags::WRAPLINE)
+                            {
+                                let next_line = end.line + 1i32;
+                                let mut last_valid_col: Option<usize> = None;
+                                for col in 0..cols {
+                                    let p = Point::new(next_line, Column(col));
+                                    if !is_valid_url_char(grid[p].c) {
+                                        break;
+                                    }
+                                    last_valid_col = Some(col);
+                                }
+                                if let Some(col) = last_valid_col {
+                                    let new_end = Point::new(next_line, Column(col));
+                                    self.regex_matches[i] =
+                                        *self.regex_matches[i].start()..=new_end;
+                                    // Don't increment — the merged match may itself wrap.
+                                    continue;
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
                 }
 
                 let grid = term.grid();
