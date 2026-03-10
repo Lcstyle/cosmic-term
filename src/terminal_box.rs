@@ -818,6 +818,13 @@ where
         let mut terminal = self.terminal.lock().unwrap();
         let buffer_size = terminal.with_buffer(|buffer| buffer.size());
 
+        // Reconcile widget focus with authoritative terminal focus state.
+        // The app-level update_terminal_focus() is always correct; if the
+        // widget state disagrees, sync it to prevent duplicate input delivery.
+        if state.is_focused && !terminal.is_focused {
+            state.is_focused = false;
+        }
+
         let is_app_cursor = terminal.term.lock().mode().contains(TermMode::APP_CURSOR);
         let is_mouse_mode = terminal.term.lock().mode().intersects(TermMode::MOUSE_MODE);
         let mut status = Status::Ignored;

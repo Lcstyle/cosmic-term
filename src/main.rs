@@ -2288,12 +2288,8 @@ impl App {
         }
     }
 
-    /// Save the current session state to disk.
-    fn save_session(&self) {
-        if !self.config.session_restore {
-            return;
-        }
-
+    /// Build the current session state (without writing to disk).
+    fn build_session_state(&self) -> session::SessionState {
         let mut windows = Vec::new();
         let mut tab_counter = 0;
 
@@ -2321,14 +2317,54 @@ impl App {
             });
         }
 
-        let state = session::SessionState {
+        session::SessionState {
             session_id: self.session_id,
             pid: std::process::id(),
             windows,
-        };
+        }
+    }
+
+    /// Save the current session state to disk.
+    fn save_session(&self) {
+        if !self.config.session_restore {
+            return;
+        }
+        let state = self.build_session_state();
         session::write_session(&state);
         // Refresh the lock file on every save so it's resilient to deletion
         session::write_lock(self.session_id);
+    }
+
+    /// Save only pinned tabs from the current session. If no pinned tabs
+    /// exist, cleans up the session entirely. The lock is removed so the
+    /// session appears as orphaned (visible in Session Manager).
+    fn save_pinned_or_cleanup(&self) {
+        if !self.config.session_restore {
+            session::cleanup_session(self.session_id);
+            return;
+        }
+
+        let state = self.build_session_state();
+        let pinned_windows: Vec<_> = state.windows.iter()
+            .filter_map(|w| {
+                w.pane_layout.pinned_only().map(|layout| session::WindowSession {
+                    is_main: w.is_main,
+                    pane_layout: layout,
+                })
+            })
+            .collect();
+
+        if pinned_windows.is_empty() {
+            session::cleanup_session(self.session_id);
+        } else {
+            let pinned_state = session::SessionState {
+                session_id: state.session_id,
+                pid: state.pid,
+                windows: pinned_windows,
+            };
+            session::write_session(&pinned_state);
+            session::remove_lock(self.session_id);
+        }
     }
 
     /// Try to restore orphaned sessions. Returns Some(Task) if restored.
@@ -2613,6 +2649,12 @@ impl App {
                 Ok(mut terminal) => {
                     terminal.set_config(config, themes);
                     terminal.pinned = pt.pinned;
+                    log::info!(
+                        "restored tab {:?}: pinned={} title={:?}",
+                        terminal_id,
+                        pt.pinned,
+                        tab_model.text(entity).unwrap_or_default()
+                    );
                     terminals.insert(terminal_id, Mutex::new(terminal));
                 }
                 Err(err) => {
@@ -2887,7 +2929,10 @@ impl App {
                 log::warn!("tried to create new tab before having event channel");
             }
         }
-        self.update_title(Some(pane))
+        Task::batch([
+            self.update_focus(),
+            self.update_title(Some(pane)),
+        ])
     }
 }
 
@@ -3807,7 +3852,10 @@ impl Application for App {
                     return self.update(Message::TitleEditSubmit);
                 }
                 self.set_pane_focus(pane);
-                return self.update_title(Some(pane));
+                return Task::batch([
+                    self.update_focus(),
+                    self.update_title(Some(pane)),
+                ]);
             }
             Message::PaneSplit(axis) => {
                 // Use focused window's pane model
@@ -3872,7 +3920,10 @@ impl Application for App {
                 let _ = focused;
                 if let Some(adjacent) = adjacent {
                     self.set_pane_focus(adjacent);
-                    return self.update_title(Some(adjacent));
+                    return Task::batch([
+                        self.update_focus(),
+                        self.update_title(Some(adjacent)),
+                    ]);
                 }
             }
             Message::PaneResized(pane_grid::ResizeEvent { split, ratio }) => {
@@ -4612,7 +4663,10 @@ impl Application for App {
                 // Shift focus to the pane / terminal
                 // with the context menu
                 self.set_pane_focus(pane);
-                return self.update_title(Some(pane));
+                return Task::batch([
+                    self.update_focus(),
+                    self.update_title(Some(pane)),
+                ]);
             }
             Message::TabNew => {
                 // Create tab in the focused window's focused pane
@@ -4976,10 +5030,9 @@ impl Application for App {
                         self.save_session();
                         session::remove_lock(self.session_id);
                     } else {
-                        // User closed the last window: clean up session entirely.
-                        // Crash recovery is handled by the periodic save + stale
-                        // lock detection, so we don't need to preserve anything here.
-                        session::cleanup_session(self.session_id);
+                        // User closed the window normally. Preserve pinned tabs
+                        // so they appear in the Session Manager; clean up if none.
+                        self.save_pinned_or_cleanup();
                     }
                 }
             }
