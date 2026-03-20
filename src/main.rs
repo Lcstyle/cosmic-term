@@ -1054,6 +1054,7 @@ impl App {
             })
             .width(Length::Fill)
             .height(Length::Fill)
+            .spacing(1.0)
             .on_click(Message::PaneClicked)
             .on_resize(space_xxs, Message::PaneResized)
             .on_drag(Message::PaneDragged);
@@ -5410,6 +5411,7 @@ impl Application for App {
         })
         .width(Length::Fill)
         .height(Length::Fill)
+        .spacing(1.0)
         .on_click(Message::PaneClicked)
         .on_resize(space_xxs, Message::PaneResized)
         .on_drag(Message::PaneDragged);
